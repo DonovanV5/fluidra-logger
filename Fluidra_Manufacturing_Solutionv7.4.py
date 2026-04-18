@@ -68,6 +68,8 @@ from schema_contract import (
     normalize_scan_records,
     normalize_scan_status,
 )
+from utils.formatting_utils import parse_expected_cycle
+from utils.path_utils import _safe_path_part, get_base_path
 
 win32print = None
 gspread = None
@@ -79,18 +81,8 @@ LocalEventStore = None
 TeraokaClient = None
 
 
-def get_base_path():
-    """Get the base path for the application, working in both development and PyInstaller bundle."""
-    if getattr(sys, 'frozen', False):
-        # Running as PyInstaller bundle
-        return os.path.dirname(sys.executable)
-    else:
-        # Running as normal Python script
-        return os.path.dirname(os.path.abspath(__file__))
-
-
 # Get the base path for the application
-BASE_PATH = get_base_path()
+BASE_PATH = get_base_path(__file__)
 LOGGER = configure_app_logger("FluidraApp", "production.log", BASE_PATH)
 APP_RUN_ID = make_correlation_id("run")
 APP_HOSTNAME = socket.gethostname()
@@ -261,11 +253,6 @@ def _normalize_logging_backend(value):
     if normalized in {"both", "google+server", "google and server", "server and google"}:
         return LOG_BACKEND_BOTH
     return LOG_BACKEND_GOOGLE
-
-
-def _safe_path_part(value, fallback="default"):
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
-    return safe.strip("._") or fallback
 
 
 ENABLE_LEGACY_DATAFRAME_SYNC_WRAPPER = True
@@ -8230,13 +8217,6 @@ class BarcodeApp(ctk.CTk):
             )
             messagebox.showerror("Error", error_msg)
             return False
-
-def parse_expected_cycle(raw):
-    try:
-        val = str(raw).replace(",", ".").split()[0]
-        return float(val)
-    except Exception:
-        return None
 
 if __name__ == '__main__':
     import traceback
