@@ -98,6 +98,31 @@ from services.downtime_service import (
 )
 from services.duplicate_service import duplicate_cache_lookup, should_refresh_barcode_cache
 from services.health_service import format_health_display_texts
+from services.print_audit_service import (
+    append_print_audit_record,
+    build_print_audit_record,
+    format_print_audit_rows,
+    print_audit_outcome_is_success,
+    read_recent_print_audit,
+)
+from services.printer_service import (
+    code128_patterns,
+    coerce_print_quantity,
+    extract_zpl_dimensions_mm,
+    fit_preview_image,
+    format_label_dimension,
+    load_zpl_preset_names as load_zpl_preset_names_from_dirs,
+    prepare_zpl_print_job,
+    printer_is_available,
+    resolve_zpl_file_path,
+    resolve_zpl_preset_path,
+    sanitize_zpl_payload,
+    send_raw_printer_job,
+    upsert_zpl_size_metadata,
+    validate_zpl_template,
+    zpl_command_tokens,
+    zpl_preset_paths,
+)
 from services.production_service import (
     build_production_event_row,
     calculate_pcs_per_min,
@@ -113,6 +138,12 @@ from services.schedule_service import (
     normalize_production_schedule,
     normalize_production_schedule_config,
     normalize_workcenter_selection,
+)
+from services.teraoka_service import (
+    load_teraoka_config as load_teraoka_config_file,
+    read_teraoka_status,
+    shutdown_teraoka_client,
+    start_teraoka_client,
 )
 from utils.formatting_utils import parse_expected_cycle
 from utils.path_utils import get_base_path
@@ -502,19 +533,7 @@ class BarcodeApp(ctk.CTk):
         """
         Get the path to a ZPL file, working both in development and when packaged.
         """
-        # First check in the custom ZPL presets directory if set
-        if hasattr(self, 'custom_zpl_presets_dir') and self.custom_zpl_presets_dir:
-            custom_path = os.path.join(self.custom_zpl_presets_dir, filename)
-            if os.path.exists(custom_path):
-                return custom_path
-        
-        # Then check in the default zpl_presets directory
-        default_path = os.path.join(ZPL_PRESETS_DIR, filename)
-        if os.path.exists(default_path):
-            return default_path
-            
-        # If not found in either location, return None
-        return None
+        return resolve_zpl_file_path(filename, getattr(self, 'custom_zpl_presets_dir', None), ZPL_PRESETS_DIR)
     
     def __init__(self):
         self._startup_perf = time.perf_counter()
@@ -2032,35 +2051,27 @@ class BarcodeApp(ctk.CTk):
         outcome="",
         error="",
     ):
-        record = {
-            "Timestamp": format_contract_timestamp(datetime.now()),
-            "Job Type": str(job_type or ""),
-            "Barcode": str(barcode or ""),
-            "Status": str(status or ""),
-            "Quantity": str(quantity or ""),
-            "Printer": str(printer_name or ""),
-            "Preset": str(preset_name or ""),
-            "Product Code": str(product_code or ""),
-            "Workcenter": str(workcenter or ""),
-            "Outcome": str(outcome or ""),
-            "Error": str(error or ""),
-        }
+        record = build_print_audit_record(
+            job_type=job_type,
+            barcode=barcode,
+            status=status,
+            quantity=quantity,
+            printer_name=printer_name,
+            preset_name=preset_name,
+            product_code=product_code,
+            workcenter=workcenter,
+            outcome=outcome,
+            error=error,
+        )
         try:
             audit_path = getattr(self, "print_audit_file", "") or os.path.join(BASE_PATH, "data", "print_audit.csv")
-            os.makedirs(os.path.dirname(audit_path), exist_ok=True)
             lock = getattr(self, "_print_audit_lock", None) or threading.Lock()
-            with lock:
-                needs_header = not os.path.exists(audit_path) or os.path.getsize(audit_path) == 0
-                with open(audit_path, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=PRINT_AUDIT_HEADERS, extrasaction="ignore")
-                    if needs_header:
-                        writer.writeheader()
-                    writer.writerow(record)
+            append_print_audit_record(audit_path, PRINT_AUDIT_HEADERS, record, lock)
         except Exception:
             LOGGER.exception(structured_message("print_audit_write_failed", audit_file=getattr(self, "print_audit_file", "")))
 
         self.last_print_record = record
-        if str(outcome).lower() in {"queued", "success"}:
+        if print_audit_outcome_is_success(outcome):
             log_event(LOGGER, logging.INFO, "print_audit_recorded", **record)
             self._set_health_signal("print", HEALTH_OK, f"{job_type} queued")
         else:
@@ -2070,12 +2081,8 @@ class BarcodeApp(ctk.CTk):
 
     def _read_recent_print_audit(self, limit=20):
         audit_path = getattr(self, "print_audit_file", "") or os.path.join(BASE_PATH, "data", "print_audit.csv")
-        if not os.path.exists(audit_path):
-            return []
         try:
-            with open(audit_path, "r", newline="", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
-            return rows[-int(limit):]
+            return read_recent_print_audit(audit_path, limit)
         except Exception:
             LOGGER.exception(structured_message("print_audit_read_failed", audit_file=audit_path))
             return []
@@ -2091,21 +2098,7 @@ class BarcodeApp(ctk.CTk):
             return []
 
     def _format_print_audit_rows(self, rows):
-        if not rows:
-            return "No print audit records yet."
-        lines = []
-        for row in rows:
-            error_text = str(row.get("Error", "") or "").strip()
-            suffix = f" | {error_text}" if error_text else ""
-            lines.append(
-                (
-                    f"{row.get('Timestamp', '')} | {row.get('Outcome', '')} | "
-                    f"{row.get('Job Type', '')} | Qty {row.get('Quantity', '')} | "
-                    f"{row.get('Barcode', '')} | {row.get('Status', '')} | "
-                    f"{row.get('Preset', '')} | {row.get('Printer', '')}{suffix}"
-                )
-            )
-        return "\n".join(lines)
+        return format_print_audit_rows(rows)
 
     def _format_health_details(self):
         try:
@@ -2357,23 +2350,14 @@ class BarcodeApp(ctk.CTk):
                 self._set_health_signal("teraoka", HEALTH_UNKNOWN, "Disabled")
                 outcome = "disabled"
             else:
-                connected = False
-                job = None
-                product_code = None
-                required_quantity = None
-                total_quantity = None
-                last_err = None
-                if hasattr(self, 'teraoka') and self.teraoka:
-                    connected = bool(self.teraoka.is_connected())
-                    job = self.teraoka.current_job()
-                    # Safely get product code and quantities if methods exist
-                    if hasattr(self.teraoka, 'product_code'):
-                        product_code = self.teraoka.product_code()
-                    if hasattr(self.teraoka, 'required_quantity'):
-                        required_quantity = self.teraoka.required_quantity()
-                    if hasattr(self.teraoka, 'total_quantity'):
-                        total_quantity = self.teraoka.total_quantity()
-                    last_err = self.teraoka.last_error()
+                status = read_teraoka_status(getattr(self, 'teraoka', None))
+                connected = status["connected"]
+                job = status["job"]
+                product_code = status["product_code"]
+                required_quantity = status["required_quantity"]
+                total_quantity = status["total_quantity"]
+                qty_made = status["qty_made"]
+                last_err = status["last_error"]
                 
                 if connected:
                     self.teraoka_status_var.set("Teraoka: CONNECTED")
@@ -2386,10 +2370,8 @@ class BarcodeApp(ctk.CTk):
                             self.teraoka_quantity_var.set(f"Outstanding: {required_quantity}")
                         if total_quantity is not None:
                             self.teraoka_required_quantity_var.set(f"Required Qty: {total_quantity}")
-                        if hasattr(self.teraoka, 'qty_made'):
-                            qty_made = self.teraoka.qty_made()
-                            if qty_made is not None:
-                                self.teraoka_qty_made_var.set(f"Qty Made: {qty_made}")
+                        if qty_made is not None:
+                            self.teraoka_qty_made_var.set(f"Qty Made: {qty_made}")
                     else:
                         self.teraoka_job_var.set("-")
                         self.teraoka_product_var.set("-")
@@ -2450,24 +2432,16 @@ class BarcodeApp(ctk.CTk):
 
     def _load_teraoka_config(self):
         try:
-            if os.path.exists(TERAOKA_CONFIG_PATH):
-                with open(TERAOKA_CONFIG_PATH, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                # Workcenters: expect list of {id, name}
-                if isinstance(data.get('workcenters'), list) and data['workcenters']:
-                    self.workcenters = [
-                        {"id": str(x.get('id', '')).strip(), "name": str(x.get('name', '')).strip()}
-                        for x in data['workcenters'] if x.get('id')
-                    ]
-                # WSDL
-                if data.get('wsdl_url'):
-                    self.teraoka_wsdl = str(data['wsdl_url']).strip()
-                # Supervisor
-                if data.get('default_supervisor'):
-                    self.teraoka_supervisor = str(data['default_supervisor']).strip()
-                # Admin password (optional)
-                if data.get('admin_password'):
-                    self.teraoka_admin_pw = str(data['admin_password'])
+            config = load_teraoka_config_file(TERAOKA_CONFIG_PATH)
+            if config.get("loaded"):
+                if config.get("workcenters"):
+                    self.workcenters = config["workcenters"]
+                if config.get("wsdl_url"):
+                    self.teraoka_wsdl = config["wsdl_url"]
+                if config.get("default_supervisor"):
+                    self.teraoka_supervisor = config["default_supervisor"]
+                if config.get("admin_password"):
+                    self.teraoka_admin_pw = config["admin_password"]
                 log_event(
                     LOGGER,
                     logging.INFO,
@@ -5114,8 +5088,12 @@ class BarcodeApp(ctk.CTk):
                 if not self.teraoka:
                     try:
                         teraoka_client_class = load_teraoka_client()
-                        self.teraoka = teraoka_client_class(self.teraoka_wsdl, self.current_workcenter, self.teraoka_supervisor)
-                        self.teraoka.start()
+                        self.teraoka = start_teraoka_client(
+                            teraoka_client_class,
+                            self.teraoka_wsdl,
+                            self.current_workcenter,
+                            self.teraoka_supervisor,
+                        )
                         try:
                             self.teraoka.enqueue_receipt(0)
                         except Exception:
@@ -5128,8 +5106,7 @@ class BarcodeApp(ctk.CTk):
             else:
                 # Turning OFF: shutdown client, set status
                 try:
-                    if self.teraoka:
-                        self.teraoka.shutdown()
+                    shutdown_teraoka_client(self.teraoka)
                 except Exception:
                     LOGGER.exception(structured_message("teraoka_shutdown_failed_on_toggle", workcenter=self.current_workcenter))
                 self.teraoka = None
@@ -6941,26 +6918,10 @@ class BarcodeApp(ctk.CTk):
         selected_preset = str(
             preset_name if preset_name is not None else (self.zpl_preset.get() if hasattr(self, 'zpl_preset') else '')
         ).strip()
-        if not selected_preset:
-            return ""
-
-        search_dirs = []
-        custom_dir = str(getattr(self, 'custom_zpl_presets_dir', '') or '').strip()
-        if custom_dir:
-            search_dirs.append(custom_dir)
-        search_dirs.append(ZPL_PRESETS_DIR)
-
-        for base_dir in search_dirs:
-            preset_path = os.path.join(base_dir, selected_preset)
-            if os.path.exists(preset_path):
-                return preset_path
-        return ""
+        return resolve_zpl_preset_path(selected_preset, getattr(self, 'custom_zpl_presets_dir', None), ZPL_PRESETS_DIR)
 
     def _format_label_dimension(self, value):
-        numeric = float(value)
-        if numeric.is_integer():
-            return str(int(numeric))
-        return f"{numeric:.2f}".rstrip("0").rstrip(".")
+        return format_label_dimension(value)
 
     def _set_label_dimensions(self, width_mm, height_mm):
         global LABEL_WIDTH, LABEL_HEIGHT
@@ -6982,51 +6943,10 @@ class BarcodeApp(ctk.CTk):
                 pass
 
     def _upsert_zpl_size_metadata(self, zpl_template, width_mm, height_mm):
-        metadata_line = (
-            f"^FX FMS_LABEL_SIZE_MM={self._format_label_dimension(width_mm)}x"
-            f"{self._format_label_dimension(height_mm)}"
-        )
-        lines = str(zpl_template or "").splitlines()
-        filtered_lines = [
-            line for line in lines
-            if not re.match(r'^\s*\^FX\s+FMS_LABEL_(SIZE_MM|WIDTH_MM|HEIGHT_MM)\s*[:=]', line, re.IGNORECASE)
-        ]
-        insert_index = 1 if filtered_lines and filtered_lines[0].strip().startswith("^XA") else 0
-        filtered_lines.insert(insert_index, metadata_line)
-        return "\n".join(filtered_lines)
+        return upsert_zpl_size_metadata(zpl_template, width_mm, height_mm)
 
     def _extract_zpl_dimensions_mm(self, preset_name="", zpl_template=""):
-        template_text = str(zpl_template or "")
-
-        size_match = re.search(
-            r'FMS_LABEL_SIZE_MM\s*[:=]\s*(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)',
-            template_text,
-            re.IGNORECASE,
-        )
-        if size_match:
-            return float(size_match.group(1)), float(size_match.group(2))
-
-        width_match = re.search(r'FMS_LABEL_WIDTH_MM\s*[:=]\s*(\d+(?:\.\d+)?)', template_text, re.IGNORECASE)
-        height_match = re.search(r'FMS_LABEL_HEIGHT_MM\s*[:=]\s*(\d+(?:\.\d+)?)', template_text, re.IGNORECASE)
-        if width_match and height_match:
-            return float(width_match.group(1)), float(height_match.group(1))
-
-        pw_match = re.search(r'\^PW(\d+)\b', template_text)
-        ll_match = re.search(r'\^LL(\d+)\b', template_text)
-        if pw_match and ll_match:
-            dpi = 203
-            return (
-                round(int(pw_match.group(1)) * 25.4 / dpi, 2),
-                round(int(ll_match.group(1)) * 25.4 / dpi, 2),
-            )
-
-        name_match = re.search(r'(\d+(?:\.\d+)?)\s*[xX]\s*(\d+(?:\.\d+)?)', str(preset_name or ""))
-        if name_match:
-            first = float(name_match.group(1))
-            second = float(name_match.group(2))
-            return min(first, second), max(first, second)
-
-        return None
+        return extract_zpl_dimensions_mm(preset_name, zpl_template)
 
     def _apply_selected_zpl_preset_dimensions(self, preset_name=None, zpl_template=""):
         selected_preset = str(
@@ -7061,15 +6981,7 @@ class BarcodeApp(ctk.CTk):
         except Exception:
             raw_quantity = None
 
-        if raw_quantity in (None, ""):
-            raw_quantity = getattr(self, 'print_quantity', 2)
-
-        try:
-            quantity = int(str(raw_quantity).strip())
-        except (TypeError, ValueError):
-            quantity = 2
-
-        quantity = max(1, min(10, quantity))
+        quantity = coerce_print_quantity(raw_quantity, getattr(self, 'print_quantity', 2))
         self.print_quantity = quantity
         try:
             if hasattr(self, 'print_quantity_var') and self.print_quantity_var is not None:
@@ -7099,60 +7011,13 @@ class BarcodeApp(ctk.CTk):
             return 2.5
 
     def _sanitize_zpl_payload(self, zpl_code):
-        zpl = str(zpl_code or "").replace('\r\n', '\n').replace('\r', '\n').strip()
-        zpl = re.sub(r'(\^XZ\s*)(?:"{3}|\'{3})\s*$', r'\1', zpl, flags=re.IGNORECASE).rstrip()
-
-        if not re.search(r'\^XA', zpl, re.IGNORECASE) or not re.search(r'\^XZ', zpl, re.IGNORECASE):
-            zpl = f"^XA\n{zpl}\n^XZ"
-
-        return zpl
+        return sanitize_zpl_payload(zpl_code)
 
     def _validate_zpl_template(self, zpl_code):
-        original = str(zpl_code or "")
-        cleaned = self._sanitize_zpl_payload(original)
-        errors = []
-        warnings = []
-
-        if not original.strip():
-            errors.append("ZPL preset is empty.")
-
-        start_match = re.search(r'\^XA', cleaned, re.IGNORECASE)
-        end_matches = list(re.finditer(r'\^XZ', cleaned, re.IGNORECASE))
-        if not start_match:
-            errors.append("Missing ^XA start command.")
-        if not end_matches:
-            errors.append("Missing ^XZ end command.")
-        if start_match and end_matches and start_match.start() > end_matches[-1].start():
-            errors.append("^XA must appear before ^XZ.")
-
-        trailing = cleaned[end_matches[-1].end():].strip() if end_matches else ""
-        if trailing:
-            errors.append("Unexpected text after final ^XZ.")
-
-        placeholders = set(re.findall(r'\{([^{}]+)\}', cleaned))
-        unknown_placeholders = sorted(placeholders - ZPL_ALLOWED_PLACEHOLDERS)
-        if unknown_placeholders:
-            errors.append(f"Unknown placeholder(s): {', '.join(unknown_placeholders)}.")
-
-        if not ({"barcode_text", "Barc"} & placeholders) and "^BC" not in cleaned.upper():
-            warnings.append("No barcode placeholder or ^BC barcode command was found.")
-
-        if original.strip() != cleaned.strip():
-            warnings.append("Trailing or malformed ZPL wrapper text will be cleaned on save.")
-
-        return cleaned, errors, warnings
+        return validate_zpl_template(zpl_code, ZPL_ALLOWED_PLACEHOLDERS)
 
     def _prepare_zpl_print_job(self, zpl_code, quantity):
-        quantity = max(1, min(10, int(quantity)))
-        zpl = self._sanitize_zpl_payload(zpl_code)
-        quantity_command = f"^PQ{quantity}"
-
-        if re.search(r'\^PQ', zpl, re.IGNORECASE):
-            zpl = re.sub(r'\^PQ[^^\r\n]*', quantity_command, zpl, count=1, flags=re.IGNORECASE)
-        else:
-            zpl = re.sub(r'\^XZ\s*$', f"{quantity_command}\n^XZ", zpl, count=1, flags=re.IGNORECASE)
-
-        return zpl + "\n"
+        return prepare_zpl_print_job(zpl_code, quantity)
 
     def _build_zpl_preview_payload(self, zpl_template):
         preset_name = self._selected_zpl_preset_name()
@@ -7210,8 +7075,7 @@ class BarcodeApp(ctk.CTk):
         return rendered_zpl, context, width_mm, height_mm
 
     def _zpl_command_tokens(self, zpl_code):
-        for match in re.finditer(r'([\^~])([A-Za-z0-9@]{1,2})([^\^~]*)', str(zpl_code or ""), re.DOTALL):
-            yield match.group(1), match.group(2).upper(), match.group(3).strip("\r\n")
+        return zpl_command_tokens(zpl_code)
 
     def _load_preview_font(self, size, bold=False):
         try:
@@ -7227,22 +7091,7 @@ class BarcodeApp(ctk.CTk):
             return None
 
     def _code128_patterns(self):
-        return [
-            "212222", "222122", "222221", "121223", "121322", "131222", "122213", "122312",
-            "132212", "221213", "221312", "231212", "112232", "122132", "122231", "113222",
-            "123122", "123221", "223211", "221132", "221231", "213212", "223112", "312131",
-            "311222", "321122", "321221", "312212", "322112", "322211", "212123", "212321",
-            "232121", "111323", "131123", "131321", "112313", "132113", "132311", "211313",
-            "231113", "231311", "112133", "112331", "132131", "113123", "113321", "133121",
-            "313121", "211331", "231131", "213113", "213311", "213131", "311123", "311321",
-            "331121", "312113", "312311", "332111", "314111", "221411", "431111", "111224",
-            "111422", "121124", "121421", "141122", "141221", "112214", "112412", "122114",
-            "122411", "142112", "142211", "241211", "221114", "413111", "241112", "134111",
-            "111242", "121142", "121241", "114212", "124112", "124211", "411212", "421112",
-            "421211", "212141", "214121", "412121", "111143", "111341", "131141", "114113",
-            "114311", "411113", "411311", "113141", "114131", "311141", "411131", "211412",
-            "211214", "211232", "2331112",
-        ]
+        return code128_patterns()
 
     def _draw_code128_barcode(self, draw, x, y, data, module_width, height, show_text=True):
         patterns = self._code128_patterns()
@@ -7407,35 +7256,18 @@ class BarcodeApp(ctk.CTk):
         return image, notes
 
     def _fit_preview_image(self, image, max_width=680, max_height=620):
-        display_image = image.copy()
-        display_image.thumbnail((max_width, max_height))
-        return display_image
+        return fit_preview_image(image, max_width, max_height)
 
     def load_zpl_preset_names(self):
         """Load just the filenames of available ZPL presets"""
-        presets = []
-
-        custom_dir = str(getattr(self, 'custom_zpl_presets_dir', '') or '').strip()
-        if custom_dir:
-            try:
-                if os.path.exists(custom_dir):
-                    presets.extend([f for f in os.listdir(custom_dir) if f.lower().endswith('.zpl')])
-            except Exception as e:
-                print(f"Error reading custom ZPL directory: {e}")
-
-        try:
-            if os.path.exists(ZPL_PRESETS_DIR):
-                default_presets = [f for f in os.listdir(ZPL_PRESETS_DIR) if f.lower().endswith('.zpl') and f not in presets]
-                presets.extend(default_presets)
-        except Exception as e:
-            print(f"Error reading default ZPL directory: {e}")
-
+        presets, errors = load_zpl_preset_names_from_dirs(getattr(self, 'custom_zpl_presets_dir', ''), ZPL_PRESETS_DIR)
+        for error in errors:
+            print(error)
         return presets
         
     def load_zpl_presets(self):
         """Load available ZPL presets with full paths"""
-        return [os.path.join(os.path.dirname(os.path.abspath(__file__)), "zpl_presets", f) 
-               for f in self.load_zpl_preset_names()]
+        return zpl_preset_paths(os.path.dirname(os.path.abspath(__file__)), self.load_zpl_preset_names())
     
     def refresh_zpl_presets(self):
         """Refresh the list of available ZPL presets"""
@@ -7561,24 +7393,7 @@ class BarcodeApp(ctk.CTk):
     def _is_printer_available(self, printer_name=None):
         """Return True if the given (or default) printer appears online/available."""
         try:
-            import win32print
-            if not printer_name:
-                printer_name = win32print.GetDefaultPrinter()
-            h = win32print.OpenPrinter(printer_name)
-            try:
-                info = win32print.GetPrinter(h, 2)
-                status = info.get('Status', 0)
-                attributes = info.get('Attributes', 0)
-                PRINTER_STATUS_ERROR = 0x00000002
-                PRINTER_STATUS_OFFLINE = 0x00000080
-                PRINTER_ATTRIBUTE_WORK_OFFLINE = 0x00040000
-                if status & (PRINTER_STATUS_ERROR | PRINTER_STATUS_OFFLINE):
-                    return False
-                if attributes & PRINTER_ATTRIBUTE_WORK_OFFLINE:
-                    return False
-                return True
-            finally:
-                win32print.ClosePrinter(h)
+            return printer_is_available(win32print, printer_name)
         except Exception:
             LOGGER.exception(
                 structured_message(
@@ -7600,19 +7415,8 @@ class BarcodeApp(ctk.CTk):
                 outcome = "unavailable"
                 raise RuntimeError(f"Zebra printer {target_printer} is offline or unavailable.")
 
-            hPrinter = win32print.OpenPrinter(target_printer)
-            try:
-                doc_info = (job_name, None, "RAW")
-                win32print.StartDocPrinter(hPrinter, 1, doc_info)
-                try:
-                    win32print.StartPagePrinter(hPrinter)
-                    win32print.WritePrinter(hPrinter, payload)
-                    win32print.EndPagePrinter(hPrinter)
-                finally:
-                    win32print.EndDocPrinter(hPrinter)
-                outcome = "sent"
-            finally:
-                win32print.ClosePrinter(hPrinter)
+            payload = send_raw_printer_job(win32print, payload, target_printer, job_name)
+            outcome = "sent"
         except Exception:
             if outcome == "started":
                 outcome = "failed"
