@@ -45,6 +45,9 @@ from fms_logging import (
     set_log_context,
     structured_message,
 )
+from job_execution.context import JobContextManager
+from job_execution.models import JobContext
+from job_execution.teraoka_adapter import job_from_teraoka_status
 from schema_contract import (
     DOWNTIME_HEADERS,
     PRODUCT_LOOKUP_COLUMNS,
@@ -144,6 +147,19 @@ from services.teraoka_service import (
     read_teraoka_status,
     shutdown_teraoka_client,
     start_teraoka_client,
+)
+from ui.job_acceptance_dialog import show_job_acceptance_dialog
+from ui.startup_screen import StartupScreen
+from ui.status_dialog import create_status_logs_dialog
+from ui.window_utils import (
+    current_monitor_geometry,
+    format_window_geometry,
+    present_app_dialog,
+    scaled_dim,
+    scaled_font,
+    set_label_color,
+    set_textbox_value,
+    tk_attribute_enabled,
 )
 from utils.formatting_utils import parse_expected_cycle
 from utils.path_utils import get_base_path
@@ -448,78 +464,6 @@ def get_product_info(product_code):
             }
     return None
 
-    # --- MAIN APPLICATION ---
-class StartupScreen(ctk.CTkFrame):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        parent.title("Initializing...")
-        parent.geometry("500x200")
-        parent.resizable(False, False)
-        
-        # Center the window
-        window_width = 500
-        window_height = 200
-        screen_width = parent.winfo_screenwidth()
-        screen_height = parent.winfo_screenheight()
-        x = (screen_width // 2) - (window_width // 2)
-        y = (screen_height // 2) - (window_height // 2)
-        parent.geometry(f'{window_width}x{window_height}+{x}+{y}')
-
-        self.configure(fg_color=parent.cget("fg_color"))
-        self.place(relx=0, rely=0, relwidth=1, relheight=1)
-        
-        # Configure grid
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-        
-        # Title
-        self.title_label = ctk.CTkLabel(
-            self, 
-            text="Fluidra Manufacturing Solution",
-            font=("Arial", 20, "bold")
-        )
-        self.title_label.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
-        
-        # Status frame
-        self.status_frame = ctk.CTkFrame(self)
-        self.status_frame.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
-        self.status_frame.grid_columnconfigure(1, weight=1)
-        
-        # Status label
-        self.status_label = ctk.CTkLabel(
-            self.status_frame,
-            text="Starting up...",
-            font=("Arial", 14)
-        )
-        self.status_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        
-        # Progress bar
-        self.progress = ctk.CTkProgressBar(self.status_frame, mode='indeterminate')
-        self.progress.grid(row=1, column=0, padx=10, pady=10, sticky="ew", columnspan=2)
-        self.progress.start()
-        
-        # Version label
-        self.version_label = ctk.CTkLabel(
-            self,
-            text="FMS v7.10",
-            font=("Arial", 10, "italic"),
-            text_color="gray"
-        )
-        self.version_label.grid(row=2, column=0, pady=(0, 10))
-        
-        # Make sure the window stays on top
-        self.tkraise()
-        parent.lift()
-        parent.attributes('-topmost', True)
-        parent.after_idle(parent.attributes, '-topmost', False)
-    
-    def update_status(self, message):
-        self.status_label.configure(text=message)
-        self.tkraise()
-        self.update_idletasks()
-
-
 class BarcodeApp(ctk.CTk):
     # Software version
     VERSION = "FMS v7.10"
@@ -732,6 +676,8 @@ class BarcodeApp(ctk.CTk):
         self.teraoka_job_value_label = None
         self.last_scanned_value = None
         self.cycle_value = None
+        self.job_context = JobContextManager()
+        self._job_acceptance_dialog = None
         
         # Auto production variables
         self.auto_prod_enabled = ctk.BooleanVar(value=False)
@@ -872,39 +818,15 @@ class BarcodeApp(ctk.CTk):
 
     @staticmethod
     def _format_window_geometry(width, height, x, y):
-        return f"{int(width)}x{int(height)}{int(x):+d}{int(y):+d}"
+        return format_window_geometry(width, height, x, y)
 
     @staticmethod
     def _tk_attribute_enabled(value):
-        return str(value).strip().lower() in {"1", "true", "yes"}
+        return tk_attribute_enabled(value)
 
     def _get_current_monitor_geometry(self):
         """Return the full monitor bounds for the screen containing this window."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class MONITORINFO(ctypes.Structure):
-                _fields_ = [
-                    ("cbSize", wintypes.DWORD),
-                    ("rcMonitor", wintypes.RECT),
-                    ("rcWork", wintypes.RECT),
-                    ("dwFlags", wintypes.DWORD),
-                ]
-
-            monitor = ctypes.windll.user32.MonitorFromWindow(self.winfo_id(), 2)
-            monitor_info = MONITORINFO()
-            monitor_info.cbSize = ctypes.sizeof(MONITORINFO)
-            if monitor and ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
-                rect = monitor_info.rcMonitor
-                width = rect.right - rect.left
-                height = rect.bottom - rect.top
-                if width > 0 and height > 0:
-                    return rect.left, rect.top, width, height
-        except Exception:
-            pass
-
-        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+        return current_monitor_geometry(self)
 
     def _keep_main_window_front(self):
         if not getattr(self, "_main_topmost_enabled", True):
@@ -926,44 +848,7 @@ class BarcodeApp(ctk.CTk):
 
     def _present_app_dialog(self, dialog, focus_widget=None, modal=True):
         """Keep app dialogs above the kiosk dashboard and ready for input."""
-        def bring_forward():
-            try:
-                dialog.attributes("-topmost", True)
-            except Exception:
-                pass
-            try:
-                dialog.lift()
-                dialog.focus_force()
-            except Exception:
-                pass
-            if focus_widget is not None:
-                try:
-                    focus_widget.focus_force()
-                except Exception:
-                    try:
-                        focus_widget.focus_set()
-                    except Exception:
-                        pass
-
-        try:
-            dialog.transient(self)
-        except Exception:
-            pass
-        try:
-            dialog.attributes("-topmost", True)
-        except Exception:
-            pass
-        if modal:
-            try:
-                dialog.grab_set()
-            except Exception:
-                pass
-        bring_forward()
-        try:
-            dialog.after(50, bring_forward)
-            dialog.after(250, bring_forward)
-        except Exception:
-            pass
+        present_app_dialog(self, dialog, focus_widget, modal)
 
     def _set_windows_taskbar_visible(self, visible):
         """Show or hide the Windows taskbar for kiosk mode."""
@@ -1081,14 +966,11 @@ class BarcodeApp(ctk.CTk):
 
     def _main_font(self, size, weight=None):
         scale = float(getattr(self, "_main_ui_scale", 1.0) or 1.0)
-        if getattr(self, "_main_ui_compact", False):
-            scale = min(scale, 0.82)
-        font_size = max(8, int(size * scale))
-        return ("Arial", font_size, weight) if weight else ("Arial", font_size)
+        return scaled_font(size, scale, getattr(self, "_main_ui_compact", False), weight)
 
     def _main_dim(self, value, minimum=1):
         scale = float(getattr(self, "_main_ui_scale", 1.0) or 1.0)
-        return max(minimum, int(value * scale))
+        return scaled_dim(value, scale, minimum)
 
     def _cancel_scan_capture_callback(self):
         after_id = getattr(self, "_scan_capture_after_id", None)
@@ -2149,6 +2031,8 @@ class BarcodeApp(ctk.CTk):
             _read_var(self.teraoka_required_quantity_var, "Required Qty: -"),
             _read_var(self.teraoka_qty_made_var, "Qty Made: -"),
             "",
+            self._format_job_context_details(),
+            "",
             "Health / Writes",
             _read_var(self.integration_health_var, "Health: -"),
             _read_var(self.write_health_var, "Writes: -"),
@@ -2256,10 +2140,7 @@ class BarcodeApp(ctk.CTk):
             return ""
 
     def _show_text_in_box(self, textbox, value):
-        textbox.configure(state="normal")
-        textbox.delete("1.0", "end")
-        textbox.insert("1.0", value)
-        textbox.configure(state="disabled")
+        set_textbox_value(textbox, value)
 
     def _reprint_last_label(self):
         context = getattr(self, "last_label_context", None)
@@ -2280,63 +2161,206 @@ class BarcodeApp(ctk.CTk):
         )
 
     def show_status_logs_dialog(self):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Status & Logs")
-        dialog.geometry("980x650")
-        dialog.minsize(850, 540)
-
-        action_bar = ctk.CTkFrame(dialog, fg_color="transparent")
-        action_bar.pack(fill="x", padx=12, pady=(12, 6))
-
-        tabview = ctk.CTkTabview(dialog)
-        tabview.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        status_tab = tabview.add("Live Status")
-        health_tab = tabview.add("Health")
-        print_tab = tabview.add("Print Audit")
-        error_tab = tabview.add("Errors")
-
-        status_text = ctk.CTkTextbox(status_tab, wrap="none")
-        status_text.pack(fill="both", expand=True, padx=8, pady=8)
-        health_text = ctk.CTkTextbox(health_tab, wrap="none")
-        health_text.pack(fill="both", expand=True, padx=8, pady=8)
-        print_text = ctk.CTkTextbox(print_tab, wrap="none")
-        print_text.pack(fill="both", expand=True, padx=8, pady=8)
-        error_text = ctk.CTkTextbox(error_tab, wrap="none")
-        error_text.pack(fill="both", expand=True, padx=8, pady=8)
-
-        def refresh():
-            self._show_text_in_box(status_text, self._format_live_status_details())
-            self._show_text_in_box(health_text, self._format_health_details())
-            self._show_text_in_box(print_text, self._format_print_audit_rows(self._read_recent_print_audit(limit=50)))
+        def errors_text():
             errors_path = os.path.join(BASE_PATH, "logs", "production_errors.log")
             errors = "".join(self._tail_text_file(errors_path, line_limit=120)).strip()
-            self._show_text_in_box(error_text, errors or "No recent error log entries.")
+            return errors or "No recent error log entries."
 
-        def sync_now():
-            try:
-                self.sync_all_to_google_sheets()
-            finally:
-                refresh()
+        return create_status_logs_dialog(
+            self,
+            live_status_text=self._format_live_status_details,
+            health_details_text=self._format_health_details,
+            print_audit_text=lambda: self._format_print_audit_rows(self._read_recent_print_audit(limit=50)),
+            errors_text=errors_text,
+            sync_now=self.sync_all_to_google_sheets,
+            reprint_last_label=self._reprint_last_label,
+            export_diagnostics_bundle=self.export_diagnostics_bundle,
+            present_dialog=self._present_app_dialog,
+        )
 
-        ctk.CTkButton(action_bar, text="Refresh", width=120, command=refresh).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Sync Now", width=120, command=sync_now).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Reprint Last Label", width=160, command=lambda: (self._reprint_last_label(), refresh())).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Export Diagnostics", width=160, command=self.export_diagnostics_bundle).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Close", width=120, command=dialog.destroy).pack(side="right")
+    def _ensure_job_context(self):
+        if not hasattr(self, "job_context") or self.job_context is None:
+            self.job_context = JobContextManager()
+        return self.job_context
 
-        refresh()
+    def _active_job_context(self):
+        return self._ensure_job_context().active_job
+
+    def _proposed_job_context(self):
+        return self._ensure_job_context().proposed_job
+
+    def _format_job_context_details(self):
+        manager = self._ensure_job_context()
+        active = manager.active_job
+        proposed = manager.proposed_job
+
+        def _line(prefix, job):
+            if not job:
+                return [f"{prefix}: -"]
+            percent = f"{job.percent_complete:.1f}%" if job.percent_complete is not None else "-"
+            return [
+                f"{prefix}: {job.job_id or '-'}",
+                f"{prefix} Product: {job.product_code or '-'}",
+                f"{prefix} Target: {job.target_quantity if job.target_quantity is not None else '-'}",
+                f"{prefix} Actual: {job.actual_quantity if job.actual_quantity is not None else '-'}",
+                f"{prefix} Remaining: {job.remaining_quantity if job.remaining_quantity is not None else '-'}",
+                f"{prefix} Complete: {percent}",
+                f"{prefix} Timing: {job.behind_ahead_status or 'Unknown'}",
+            ]
+
+        lines = ["Job Execution"]
+        lines.extend(_line("Active Job", active))
+        lines.extend(_line("Proposed Job", proposed))
+        return "\n".join(lines)
+
+    def _sync_teraoka_proposed_job(self, status, prompt=True):
+        manager = self._ensure_job_context()
+        proposed_job = job_from_teraoka_status(status, self.current_workcenter)
+        if proposed_job is None:
+            manager.clear_proposed_job()
+            return None
+
+        previous_key = manager.proposed_job.key if manager.proposed_job else ""
+        manager.propose_job(proposed_job)
+        if previous_key != proposed_job.key:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "job_context_proposed",
+                source=proposed_job.source,
+                job_id=proposed_job.job_id,
+                sequence=proposed_job.sequence,
+                product_code=proposed_job.product_code,
+                target_quantity=proposed_job.target_quantity,
+                workcenter=proposed_job.workcenter,
+            )
+
+        if prompt and manager.requires_acceptance(proposed_job):
+            self._prompt_for_job_acceptance(proposed_job)
+        return proposed_job
+
+    def _prompt_for_job_acceptance(self, job: JobContext):
+        if not self.teraoka_enabled.get():
+            return None
         try:
-            tabview.set("Live Status")
+            existing_dialog = getattr(self, "_job_acceptance_dialog", None)
+            if existing_dialog is not None and existing_dialog.winfo_exists():
+                return existing_dialog
         except Exception:
             pass
-        self._present_app_dialog(dialog)
-        return dialog
+
+        def on_cancel(_job):
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "job_acceptance_deferred",
+                source=_job.source,
+                job_id=_job.job_id,
+                product_code=_job.product_code,
+                workcenter=_job.workcenter,
+            )
+            self._job_acceptance_dialog = None
+            self._schedule_scan_focus()
+
+        self._job_acceptance_dialog = show_job_acceptance_dialog(
+            self,
+            job,
+            accept_callback=self._accept_proposed_job,
+            cancel_callback=on_cancel,
+            present_dialog=self._present_app_dialog,
+        )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "job_acceptance_prompt_shown",
+            source=job.source,
+            job_id=job.job_id,
+            product_code=job.product_code,
+            workcenter=job.workcenter,
+        )
+        return self._job_acceptance_dialog
+
+    def _apply_accepted_job_product(self, job: JobContext):
+        product_code = str(job.product_code or "").strip()
+        if not product_code:
+            return False
+        try:
+            self._select_product(product_code)
+        except Exception:
+            LOGGER.exception(
+                structured_message(
+                    "job_acceptance_product_select_failed",
+                    job_id=job.job_id,
+                    product_code=product_code,
+                    workcenter=job.workcenter,
+                )
+            )
+            self.product_var.set(product_code)
+            try:
+                self.update_description_on_select(product_code)
+            except Exception:
+                LOGGER.exception(
+                    structured_message(
+                        "job_acceptance_product_details_update_failed",
+                        job_id=job.job_id,
+                        product_code=product_code,
+                    )
+                )
+        return True
+
+    def _accept_proposed_job(self, job: JobContext | None = None):
+        manager = self._ensure_job_context()
+        if job is not None and (manager.proposed_job is None or manager.proposed_job.key != job.key):
+            manager.propose_job(job)
+        accepted_job = manager.accept_proposed_job()
+        if accepted_job is None:
+            return False
+
+        self._apply_accepted_job_product(accepted_job)
+        self._set_health_signal("teraoka", HEALTH_OK, f"Job accepted: {accepted_job.job_id}")
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "job_context_accepted",
+            source=accepted_job.source,
+            job_id=accepted_job.job_id,
+            sequence=accepted_job.sequence,
+            product_code=accepted_job.product_code,
+            target_quantity=accepted_job.target_quantity,
+            actual_quantity=accepted_job.actual_quantity,
+            remaining_quantity=accepted_job.remaining_quantity,
+            workcenter=accepted_job.workcenter,
+        )
+        self._job_acceptance_dialog = None
+        try:
+            self._update_scan_entry_state()
+        except Exception:
+            pass
+        self._schedule_scan_focus(force=True, attempts=3)
+        return True
+
+    def _teraoka_job_ready_for_scan(self, prompt=True):
+        if not self.teraoka_enabled.get():
+            return True, "Teraoka disabled"
+        try:
+            status = read_teraoka_status(getattr(self, 'teraoka', None))
+        except Exception:
+            LOGGER.exception(structured_message("teraoka_status_read_failed_for_scan", workcenter=self.current_workcenter))
+            return False, "Scanning is enabled only when Teraoka is connected and a job is received."
+
+        proposed_job = self._sync_teraoka_proposed_job(status, prompt=prompt)
+        if proposed_job is None:
+            return False, "Scanning is enabled only when Teraoka is connected and a job is received."
+        if not self._ensure_job_context().is_active_for(proposed_job):
+            return False, "Please accept the proposed Teraoka job before scanning."
+        return True, "Teraoka job accepted"
 
     def poll_teraoka_status(self):
         started_at = time.perf_counter()
         outcome = "unknown"
         try:
             if not self.teraoka_enabled.get():
+                self._ensure_job_context().clear_proposed_job()
                 self.teraoka_status_var.set("Teraoka: DISABLED")
                 self.teraoka_job_var.set("-")
                 self.teraoka_product_var.set("-")
@@ -2362,6 +2386,7 @@ class BarcodeApp(ctk.CTk):
                 if connected:
                     self.teraoka_status_var.set("Teraoka: CONNECTED")
                     if job:
+                        self._sync_teraoka_proposed_job(status, prompt=True)
                         self.teraoka_job_var.set(f"{job}")
                         # Update product and quantity labels if available
                         if product_code is not None:
@@ -2373,6 +2398,7 @@ class BarcodeApp(ctk.CTk):
                         if qty_made is not None:
                             self.teraoka_qty_made_var.set(f"Qty Made: {qty_made}")
                     else:
+                        self._ensure_job_context().clear_proposed_job()
                         self.teraoka_job_var.set("-")
                         self.teraoka_product_var.set("-")
                         self.teraoka_quantity_var.set("Outstanding: -")
@@ -5133,17 +5159,8 @@ class BarcodeApp(ctk.CTk):
                 self.barcode_entry.configure(state="normal")
                 self._schedule_scan_focus()
                 return
-            # Teraoka enabled: require connected AND job available
-            connected = False
-            job_ok = False
-            try:
-                if getattr(self, 'teraoka', None):
-                    connected = bool(self.teraoka.is_connected())
-                    job_ok = bool(self.teraoka.current_job())
-            except Exception:
-                connected = False
-                job_ok = False
-            ready = connected and job_ok
+            # Teraoka enabled: require connected, job available, and operator-accepted context.
+            ready, _detail = self._teraoka_job_ready_for_scan(prompt=False)
             self.barcode_entry.configure(state=("normal" if ready else "disabled"))
             if ready:
                 self._schedule_scan_focus()
@@ -6255,24 +6272,20 @@ class BarcodeApp(ctk.CTk):
                 )
                 return False
 
-            # If Teraoka is enabled, require connection and job before scanning
+            # If Teraoka is enabled, require connection, job, and operator acceptance before scanning.
             if self.teraoka_enabled.get():
-                try:
-                    connected = bool(self.teraoka and self.teraoka.is_connected())
-                    job = (self.teraoka.current_job() if (self.teraoka and connected) else None)
-                except Exception:
-                    connected = False
-                    job = None
-                if not (connected and job):
-                    messagebox.showwarning("Teraoka Not Ready", "Scanning is enabled only when Teraoka is connected and a job is received.")
-                    scan_outcome = "rejected_teraoka_not_ready"
+                teraoka_ready, teraoka_detail = self._teraoka_job_ready_for_scan(prompt=True)
+                if not teraoka_ready:
+                    messagebox.showwarning("Teraoka Not Ready", teraoka_detail)
+                    scan_outcome = "rejected_teraoka_job_not_ready"
                     LOGGER.warning(
                         structured_message(
-                            "scan_rejected_teraoka_not_ready",
+                            "scan_rejected_teraoka_job_not_ready",
                             barcode=normalized_barcode,
                             scan_id=scan_id,
                             status=status,
                             workcenter=self.current_workcenter,
+                            detail=teraoka_detail,
                         )
                     )
                     return False
@@ -6776,10 +6789,7 @@ class BarcodeApp(ctk.CTk):
 
 
     def _set_label_color(self, label, color):
-        try:
-            label.configure(text_color=color)
-        except Exception:
-            pass
+        set_label_color(label, color)
 
     def _apply_status_colors(self):
         try:

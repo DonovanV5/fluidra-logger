@@ -1,0 +1,98 @@
+
+Review Readiness
+
+Branch: refactor/logger-modular-phase1
+Tracked working tree: clean
+Validation: 42 passed via the existing pytest suite
+Refactor commits on top of logger baseline:
+
+1107471 Extract logger pure utility helpers
+d77bfd3 Extract logger persistence helpers
+9f57a01 Extract logger operational services
+2ce6d8e Extract logger integration services
+deb1ca5 Extract logger UI scaffolding
+Refactor delta since baseline import: 24 files changed, 1585 insertions, 860 deletions.
+
+Suggested PR title:
+
+Modularize manufacturing logger without behavior changes
+Suggested PR summary:
+
+Controlled modular refactor of the manufacturing logger. Extracts pure utilities, persistence helpers, operational services, integration helpers, and UI scaffolding while preserving existing app orchestration, local-first persistence, operator workflows, schema outputs, print behavior, Teraoka behavior, and startup sequencing.
+Module Ownership
+
+Module	Owns	Does Not Own	Change Here For
+Fluidra_Manufacturing_Solutionv7.4.py	Main app lifecycle, BarcodeApp, startup sequencing, operator workflows, orchestration, UI event flow	Pure helpers, low-level persistence mechanics, ZPL parsing, audit formatting	Scan flow, production start/stop flow, popup behavior, sync orchestration, UI wiring
+schema_contract.py	Canonical downstream row/header contracts	UI, storage mechanics, print behavior	Sheet/CSV field contracts, row builders, scan status normalization
+local_event_store.py	SQLite local-first event durability	Google/CSV sync orchestration, UI	Local DB schema, idempotent append/fetch behavior
+fms_logging.py	Structured logging and health-state primitives	App-specific workflows	Log formatting, health colors/states, correlation IDs
+startup_self_checks.py	Startup readiness checks	UI startup sequence	File, directory, printer, SQLite, Google, Teraoka readiness logic
+teraoka_client.py	Actual Teraoka client integration	UI status rendering	SOAP/client behavior and receipt polling internals
+Packages
+
+Module	Owns	Change Here For
+utils/path_utils.py	Base path and safe path-name helpers	Packaged/dev path resolution, filename-safe path parts
+utils/formatting_utils.py	Small pure formatting parsers	Expected cycle parsing
+persistence/local_store_service.py	Local store construction helper	Local store factory behavior
+persistence/excel_export_service.py	Excel export DataFrame shaping and sheet styling	Export column order/fill behavior, worksheet styling
+persistence/google_sync_service.py	Google row building, fallback key resolution, row matching	Legacy sheet compatibility and sync row comparison
+persistence/server_csv_service.py	Server CSV paths, atomic writes, reads	Server CSV folder/file conventions
+services/scan_service.py	Barcode normalization and scan cycle timing	Barcode canonicalization, cycle-time helper behavior
+services/duplicate_service.py	In-memory duplicate/cache decisions	Cache lookup policy, stale-cache timing checks
+services/production_service.py	Production event row helpers and production metrics	Production duration and PCS/min calculations
+services/downtime_service.py	Downtime row helpers and downtime validation helpers	Auto-downtime multiplier and resume-button logic
+services/schedule_service.py	Schedule config normalization, planned-break windows, workcenter normalization	Planned break timing and schedule compatibility
+services/health_service.py	Health footer/status text aggregation	Health display text and aggregate state rules
+services/diagnostics_service.py	Diagnostics metadata, redaction, health text	Diagnostics bundle data shaping and secret masking
+services/printer_service.py	ZPL helpers, preset paths, printer availability/raw send helpers	ZPL validation, print quantity, dimensions, raw printer mechanics
+services/print_audit_service.py	Print audit records, CSV append/read, display formatting	Print audit CSV behavior and audit text formatting
+services/teraoka_service.py	Teraoka config parsing and client start/status/shutdown wrappers	Workcenter config parsing and Teraoka status reads
+ui/startup_screen.py	Startup screen component	Startup screen layout/text/progress behavior
+ui/status_dialog.py	Status & Logs dialog layout	Tabs/buttons/layout for status dialog
+ui/window_utils.py	Window geometry, dialog presentation, scaling, textbox/label helpers	Kiosk geometry helpers, dialog topmost/modal behavior
+Dependency Flow
+
+Intended direction:
+
+Fluidra_Manufacturing_Solutionv7.4.py
+  -> ui/*
+  -> services/*
+  -> persistence/*
+  -> utils/*
+  -> schema_contract.py
+  -> fms_logging.py
+  -> startup_self_checks.py
+  -> local_event_store.py
+  -> teraoka_client.py
+
+ui/* receives callbacks/data from main.
+services/* must not import the main app.
+persistence/* must not own UI or workflow orchestration.
+utils/* stays pure and low-level.
+schema_contract.py remains the source of downstream field contracts.
+Where To Change This
+
+Add/change schema fields: schema_contract.py, then update sync/export callers carefully.
+Change local-first persistence: local_event_store.py and main orchestration in log_scan_to_excel; do not reorder local commit after downstream sync.
+Change Google row compatibility: persistence/google_sync_service.py.
+Change server CSV layout: persistence/server_csv_service.py.
+Change Excel export formatting: persistence/excel_export_service.py.
+Change duplicate cache behavior: services/duplicate_service.py; durable lookups still live in main.
+Change barcode normalization: services/scan_service.py.
+Change schedule/planned breaks: services/schedule_service.py.
+Change production/downtime calculations: services/production_service.py or services/downtime_service.py.
+Change printer/ZPL behavior: services/printer_service.py; operator-facing print flow remains in main.
+Change print audit CSV/display: services/print_audit_service.py and PRINT_AUDIT_HEADERS in main.
+Change Teraoka config/status helpers: services/teraoka_service.py; UI/status handling remains in main.
+Change startup screen: ui/startup_screen.py.
+Change Status & Logs dialog layout: ui/status_dialog.py.
+Change setup, duplicate, downtime popups: still in BarcodeApp until a future focused UI extraction.
+Guardrails
+
+Do not import Fluidra_Manufacturing_Solutionv7.4.py from service, persistence, utility, or UI modules.
+Keep local commit first, downstream sync second.
+Keep schema/header changes explicit and reviewed.
+Keep app workflow orchestration in BarcodeApp unless extracting a fully smoke-tested slice.
+Preserve wrapper methods in BarcodeApp while tests or UI call them.
+Avoid moving modal/scanner-focus behavior together with unrelated code.
+Add tests before changing duplicate detection, print behavior, schedule logic, or sync contracts.

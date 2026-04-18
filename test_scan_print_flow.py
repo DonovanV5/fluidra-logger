@@ -55,6 +55,52 @@ class FakeClient:
         return FakeWorkbook()
 
 
+class FakeTeraoka:
+    def __init__(
+        self,
+        *,
+        connected=True,
+        job="JOB-100",
+        product_code="P-100",
+        required_quantity=8,
+        total_quantity=10,
+        qty_made=2,
+        last_error=None,
+    ):
+        self.connected = connected
+        self.job = job
+        self.product_code_value = product_code
+        self.required_quantity_value = required_quantity
+        self.total_quantity_value = total_quantity
+        self.qty_made_value = qty_made
+        self.last_error_value = last_error
+        self.receipts = []
+
+    def is_connected(self):
+        return self.connected
+
+    def current_job(self):
+        return self.job
+
+    def product_code(self):
+        return self.product_code_value
+
+    def required_quantity(self):
+        return self.required_quantity_value
+
+    def total_quantity(self):
+        return self.total_quantity_value
+
+    def qty_made(self):
+        return self.qty_made_value
+
+    def last_error(self):
+        return self.last_error_value
+
+    def enqueue_receipt(self, quantity):
+        self.receipts.append(quantity)
+
+
 def load_app_module():
     source_path = Path(__file__).with_name("Fluidra_Manufacturing_Solutionv7.4.py")
     spec = importlib.util.spec_from_file_location("fms_app_under_test", source_path)
@@ -100,9 +146,15 @@ def make_app(module):
     app.description_var = ValueVar("")
     app.PC_var = ValueVar("")
     app.cycle_time_var = ValueVar("")
+    app.expected_cycle = 0.0
+    app.expected_cycle_var = ValueVar("N/A")
+    app.barcode_label_var = ValueVar("")
     app.pcs_min_var = ValueVar("0.00")
     app.operator_name_var = ValueVar("Operator")
     app.teraoka_enabled = ValueVar(False)
+    app.teraoka = None
+    app.job_context = module.JobContextManager()
+    app._job_acceptance_dialog = None
     app.health_signals = {}
     app.last_successful_server_csv_write_at = None
     app._barcode_cache = set()
@@ -294,6 +346,96 @@ class ScanPrintFlowTests(TestCase):
         self.assertRegex(log_requests[0][1]["scan_id"], r"^scan_\d{14}_[0-9a-f]{8}$")
         self.assertEqual(print_requests[0]["status"], "Scanned")
         self.assertEqual(print_requests[0]["scan_id"], log_requests[0][1]["scan_id"])
+
+    def test_teraoka_status_proposes_job_without_accepting_it(self):
+        app = make_app(self.module)
+        app.teraoka_enabled = ValueVar(True)
+        app.teraoka = FakeTeraoka()
+
+        proposed = app._sync_teraoka_proposed_job(
+            self.module.read_teraoka_status(app.teraoka),
+            prompt=False,
+        )
+
+        self.assertIsNotNone(proposed)
+        self.assertEqual(proposed.job_id, "JOB-100")
+        self.assertEqual(proposed.product_code, "P-100")
+        self.assertEqual(proposed.target_quantity, 10)
+        self.assertEqual(proposed.actual_quantity, 2)
+        self.assertEqual(proposed.remaining_quantity, 8)
+        self.assertEqual(proposed.percent_complete, 20.0)
+        self.assertIsNone(app.job_context.active_job)
+
+    def test_accepting_teraoka_job_sets_active_context_and_product(self):
+        app = make_app(self.module)
+        app.teraoka_enabled = ValueVar(True)
+        app.teraoka = FakeTeraoka()
+        app.barcode_entry = mock.Mock()
+        app.get_product_info_from_sources = lambda code: {
+            "description": "Pump",
+            "Barc": "BARC-100",
+            "PC": code,
+            "Expected_Cycle": "10.00 sec",
+        }
+
+        proposed = app._sync_teraoka_proposed_job(
+            self.module.read_teraoka_status(app.teraoka),
+            prompt=False,
+        )
+        accepted = app._accept_proposed_job(proposed)
+
+        self.assertTrue(accepted)
+        self.assertIsNotNone(app.job_context.active_job)
+        self.assertEqual(app.job_context.active_job.job_id, "JOB-100")
+        self.assertEqual(app.product_var.get(), "P-100")
+        self.assertEqual(app.description_var.get(), "Pump")
+        self.assertEqual(app.barcode_label_var.get(), "BARC-100")
+        self.assertEqual(app.expected_cycle, 10.0)
+
+    def test_teraoka_enabled_scan_requires_accepted_job(self):
+        app = make_app(self.module)
+        app.teraoka_enabled = ValueVar(True)
+        app.teraoka = FakeTeraoka()
+        prompts = []
+        app._prompt_for_job_acceptance = lambda job: prompts.append(job)
+        app.log_scan_to_excel = lambda *args, **kwargs: self.fail("Scan should not log before job acceptance")
+        app.print_label = lambda *args, **kwargs: self.fail("Scan should not print before job acceptance")
+
+        with mock.patch.object(self.module.messagebox, "showwarning") as warning:
+            accepted = app.handle_scan(None, barcode_override="ABC123")
+
+        self.assertFalse(accepted)
+        self.assertEqual(len(prompts), 1)
+        self.assertIsNotNone(app.job_context.proposed_job)
+        self.assertIsNone(app.job_context.active_job)
+        warning.assert_called_once()
+        self.assertIn("accept the proposed Teraoka job", warning.call_args.args[1])
+
+    def test_teraoka_enabled_scan_allows_accepted_job(self):
+        app = make_app(self.module)
+        app.teraoka_enabled = ValueVar(True)
+        app.teraoka = FakeTeraoka()
+        app.barcode_entry = mock.Mock()
+        log_requests = []
+        print_requests = []
+        app.get_product_info_from_sources = lambda code: {
+            "description": "Pump",
+            "Barc": "BARC-100",
+            "PC": code,
+            "Expected_Cycle": "10.00 sec",
+        }
+        app.log_scan_to_excel = lambda barcode, **kwargs: log_requests.append((barcode, kwargs)) or True
+        app.print_label = lambda **kwargs: print_requests.append(kwargs) or True
+        app._sync_teraoka_proposed_job(self.module.read_teraoka_status(app.teraoka), prompt=False)
+        self.assertTrue(app._accept_proposed_job())
+
+        accepted = app.handle_scan(None, barcode_override="ABC123")
+
+        self.assertTrue(accepted)
+        self.assertEqual(app.production_count, 1)
+        self.assertEqual(log_requests[0][1]["status"], "Scanned")
+        self.assertEqual(print_requests[0]["PC"], "P-100")
+        self.assertEqual(app.teraoka.receipts, [1])
 
     def test_duplicate_scan_routes_to_popup_without_printing(self):
         app = make_app(self.module)
