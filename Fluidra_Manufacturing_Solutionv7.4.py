@@ -68,8 +68,26 @@ from schema_contract import (
     normalize_scan_records,
     normalize_scan_status,
 )
+from persistence.excel_export_service import build_export_dataframe, style_excel_export_sheet
+from persistence.google_sync_service import (
+    build_sheet_row,
+    format_sheet_row_ref,
+    normalize_sheet_text,
+    resolve_sheet_value,
+    sheet_row_matches_payload,
+)
+from persistence.local_store_service import create_local_event_store
+from persistence.server_csv_service import (
+    read_csv_records,
+    server_csv_path,
+    server_csv_root_dir,
+    server_csv_station_dir,
+    server_product_csv_path,
+    server_product_csv_paths,
+    write_rows_to_csv_atomic,
+)
 from utils.formatting_utils import parse_expected_cycle
-from utils.path_utils import _safe_path_part, get_base_path
+from utils.path_utils import get_base_path
 
 win32print = None
 gspread = None
@@ -1864,37 +1882,16 @@ class BarcodeApp(ctk.CTk):
         return max(0.0, (now - previous_scan_time).total_seconds())
 
     def _build_sheet_row(self, data_map, headers):
-        row = []
-        for col in headers:
-            key = (col or "").strip()
-            if not key:
-                row.append("")
-                continue
-            row.append(self._resolve_sheet_value(data_map, key))
-        return row
+        return build_sheet_row(data_map, headers)
 
     def _resolve_sheet_value(self, data_map, key):
-        normalized_key = (key or "").strip()
-        if not normalized_key:
-            return ""
-        for candidate in (
-            normalized_key,
-            normalized_key.replace(" ", "_"),
-            normalized_key.replace("_", " "),
-        ):
-            if candidate in data_map:
-                return data_map.get(candidate, "")
-        return ""
+        return resolve_sheet_value(data_map, key)
 
     def _normalize_sheet_text(self, value):
-        if value is None:
-            return ""
-        return str(value).strip()
+        return normalize_sheet_text(value)
 
     def _format_sheet_row_ref(self, worksheet_title, row_number):
-        if not row_number:
-            return None
-        return f"{worksheet_title}!{int(row_number)}"
+        return format_sheet_row_ref(worksheet_title, row_number)
 
     def _ensure_worksheet_capacity(self, ws, min_rows=1, min_cols=1):
         try:
@@ -1937,15 +1934,7 @@ class BarcodeApp(ctk.CTk):
         return headers, sync_col_index
 
     def _sheet_row_matches_payload(self, row_values, header_row, data_map):
-        for index, header in enumerate(header_row):
-            key = self._normalize_sheet_text(header)
-            if not key or key == SYNC_EVENT_ID_HEADER:
-                continue
-            actual_value = self._normalize_sheet_text(row_values[index] if index < len(row_values) else "")
-            expected_value = self._normalize_sheet_text(self._resolve_sheet_value(data_map, key))
-            if actual_value != expected_value:
-                return False
-        return True
+        return sheet_row_matches_payload(row_values, header_row, data_map, SYNC_EVENT_ID_HEADER)
 
     def _locate_existing_sheet_event(self, ws, title, values, header_row, event_id, data_map, sync_col_index):
         try:
@@ -3103,7 +3092,7 @@ class BarcodeApp(ctk.CTk):
     def initialize_local_store(self):
         started_at = time.perf_counter()
         try:
-            self.local_store = LocalEventStore(self.local_db_file)
+            self.local_store = create_local_event_store(self.local_db_file, LocalEventStore)
             self._set_local_store_health_success("SQLite ready")
             log_event(
                 LOGGER,
@@ -3195,67 +3184,32 @@ class BarcodeApp(ctk.CTk):
             return set()
 
     def _build_export_dataframe(self, rows, headers, normalize_scans=False):
-        if normalize_scans:
-            return self._normalize_scan_dataframe(pd.DataFrame(rows))
-
-        df = pd.DataFrame(rows)
-        for header in headers:
-            if header not in df.columns:
-                df[header] = ""
-        if df.empty:
-            return pd.DataFrame(columns=headers)
-        return df[headers].fillna("")
+        return build_export_dataframe(pd, rows, headers, normalize_scans, self._normalize_scan_dataframe)
 
     def _server_csv_root_dir(self):
-        return str(getattr(self, "server_csv_dir", "") or "").strip()
+        return server_csv_root_dir(getattr(self, "server_csv_dir", ""))
 
     def _server_csv_station_dir(self):
         root = self._server_csv_root_dir()
-        if not root:
-            return ""
-        workcenter = _safe_path_part(getattr(self, "current_workcenter", ""), "workcenter")
-        station = _safe_path_part(APP_HOSTNAME, "station")
-        return os.path.join(root, workcenter, station)
+        return server_csv_station_dir(root, getattr(self, "current_workcenter", ""), APP_HOSTNAME)
 
     def _server_csv_path(self, sheet_name):
         station_dir = self._server_csv_station_dir()
-        if not station_dir:
-            return ""
-        filename = SERVER_CSV_FILENAMES.get(sheet_name, f"{_safe_path_part(sheet_name)}.csv")
-        return os.path.join(station_dir, filename)
+        return server_csv_path(station_dir, sheet_name, SERVER_CSV_FILENAMES)
 
     def _server_product_csv_paths(self):
         root = self._server_csv_root_dir()
-        if not root:
-            return []
-        return [
-            self._server_product_csv_path(),
-            os.path.join(root, "Products.csv"),
-            os.path.join(root, "Products", "products.csv"),
-            os.path.join(root, "Products", "Products.csv"),
-        ]
+        return server_product_csv_paths(root, self._server_product_csv_path())
 
     def _server_product_csv_path(self):
         root = self._server_csv_root_dir()
-        if not root:
-            return ""
-        return os.path.join(root, "products.csv")
+        return server_product_csv_path(root)
 
     def _write_rows_to_csv_atomic(self, path, rows, headers):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        temp_path = f"{path}.{APP_RUN_ID}.tmp"
-        with open(temp_path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
-            writer.writeheader()
-            for row in rows:
-                writer.writerow({header: row.get(header, "") for header in headers})
-        os.replace(temp_path, path)
+        write_rows_to_csv_atomic(path, rows, headers, APP_RUN_ID)
 
     def _read_csv_records(self, path):
-        if not path or not os.path.exists(path):
-            return []
-        with open(path, "r", newline="", encoding="utf-8-sig") as f:
-            return list(csv.DictReader(f))
+        return read_csv_records(path)
 
     def _google_product_rows_for_server_csv(self):
         values = []
@@ -3538,15 +3492,7 @@ class BarcodeApp(ctk.CTk):
         return self.get_product_info_from_sources(product_code)
 
     def _style_excel_export_sheet(self, worksheet):
-        header_fill = PatternFill(start_color='D3D3D3', end_color='D3D3D3', fill_type='solid')
-        for cell in worksheet[1]:
-            cell.fill = header_fill
-        for col in worksheet.columns:
-            try:
-                column_letter = col[0].column_letter
-                worksheet.column_dimensions[column_letter].width = 20
-            except Exception:
-                continue
+        style_excel_export_sheet(worksheet, PatternFill)
 
     def _export_local_store_to_excel(self):
         if self.local_store is None:
