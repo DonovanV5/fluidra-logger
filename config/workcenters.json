@@ -1,0 +1,20 @@
+{
+    "workcenters": [
+        {
+            "id": "Q-PP",
+            "name": "Pump Production"
+        },
+        {
+            "id": "Q-ASM",
+            "name": "Assembly"
+        },
+        {
+            "id": "Q-TST",
+            "name": "Testing"
+        },
+        {
+            "id": "Q-PKG",
+            "name": "Packaging"
+        }
+    ]
+}

@@ -1,0 +1,7 @@
+{
+"printer_name": "Zebra_Label_Printer",
+  "label_width": 800,
+  "label_height": 600,
+  "logo_path": "logo.png",
+  "background_path": "background.png"
+}

@@ -1,0 +1,32 @@
+# Crypto Trading Research System Dependencies
+# Python 3.11 compatible
+
+# Core data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Cryptocurrency exchange library
+ccxt>=4.0.0
+
+# Technical analysis library
+ta>=0.10.2
+
+# Machine learning
+scikit-learn>=1.3.0
+
+# Visualization
+matplotlib>=3.7.0
+
+# Plant Overview Dashboard
+dash>=2.14.0
+plotly>=5.18.0
+
+# Google Sheets integration
+gspread>=5.10.0
+oauth2client>=4.1.3
+
+# Configuration parsing
+PyYAML>=6.0
+
+# Additional utilities
+python-dateutil>=2.8.2

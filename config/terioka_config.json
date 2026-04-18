@@ -1,0 +1,43 @@
+{
+  "workcenters": [
+    {
+      "id": "Q-PP",
+      "name": "Pump_line"
+    },
+    {
+      "id": "Q-PC3",
+      "name": "APC 3"
+    },
+    {
+      "id": "Q-PC5",
+      "name": "APC 5"
+    },
+    {
+      "id": "Q-AC",
+      "name": "Accesories"
+    },
+    {
+      "id": "Q-FLT",
+      "name": "Filter Production"
+    },
+    {
+      "id": "Q-MPV",
+      "name": "Multi-Port Valves"
+    },
+    {
+      "id": "Q-LT",
+      "name": "Lighting"
+    },
+    {
+      "id": "M23",
+      "name": "Machine 23"
+    },
+    {
+      "id": "M24",
+      "name": "Machine 24"
+    }
+  ],
+  "wsdl_url": "http://10.61.6.30:9084/Teraoka_Manufacturing_Web_Service.svc?wsdl",
+  "default_supervisor": "1019",
+  "admin_password": "admin"
+}

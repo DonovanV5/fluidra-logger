@@ -1,0 +1,54 @@
+﻿# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+build/
+dist/
+Distribution -*/
+*.zip
+
+# Runtime logs and generated local data
+logs/
+diagnostics/
+*.log
+app_errors.log
+run_output*.log
+test_output.log
+barcode_log.xlsx
+data/*.sqlite3
+data/*.db
+data/print_audit.csv
+zeep_cache.sqlite
+
+# Local operator/runtime configuration
+config/user_prefs.json
+
+# Google service-account credential. Keep the filename/path local for runtime,
+# but do not commit private keys.
+pumpline-logger.json

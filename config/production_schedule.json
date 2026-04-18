@@ -1,0 +1,34 @@
+{
+  "defaults": {
+    "shift_start": "07:15",
+    "shift_end": "15:15",
+    "tea1_start": "09:30",
+    "tea1_end": "09:45",
+    "lunch_start": "12:00",
+    "lunch_end": "12:30",
+    "tea2_start": "14:00",
+    "tea2_end": "14:15"
+  },
+  "workcenters": {
+    "M23": {
+      "shift_start": "07:00",
+      "shift_end": "15:30",
+      "tea1_start": "09:00",
+      "tea1_end": "09:15",
+      "lunch_start": "12:00",
+      "lunch_end": "12:30",
+      "tea2_start": "14:00",
+      "tea2_end": "14:15"
+    },
+    "Q-PP": {
+      "shift_start": "07:30",
+      "shift_end": "15:30",
+      "tea1_start": "09:00",
+      "tea1_end": "09:15",
+      "lunch_start": "12:00",
+      "lunch_end": "12:30",
+      "tea2_start": "14:00",
+      "tea2_end": "14:15"
+    }
+  }
+}
