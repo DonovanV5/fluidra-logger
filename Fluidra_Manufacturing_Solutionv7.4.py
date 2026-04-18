@@ -145,6 +145,18 @@ from services.teraoka_service import (
     shutdown_teraoka_client,
     start_teraoka_client,
 )
+from ui.startup_screen import StartupScreen
+from ui.status_dialog import create_status_logs_dialog
+from ui.window_utils import (
+    current_monitor_geometry,
+    format_window_geometry,
+    present_app_dialog,
+    scaled_dim,
+    scaled_font,
+    set_label_color,
+    set_textbox_value,
+    tk_attribute_enabled,
+)
 from utils.formatting_utils import parse_expected_cycle
 from utils.path_utils import get_base_path
 
@@ -447,78 +459,6 @@ def get_product_info(product_code):
                 "Expected_Cycle": expected_cycle_display
             }
     return None
-
-    # --- MAIN APPLICATION ---
-class StartupScreen(ctk.CTkFrame):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        parent.title("Initializing...")
-        parent.geometry("500x200")
-        parent.resizable(False, False)
-        
-        # Center the window
-        window_width = 500
-        window_height = 200
-        screen_width = parent.winfo_screenwidth()
-        screen_height = parent.winfo_screenheight()
-        x = (screen_width // 2) - (window_width // 2)
-        y = (screen_height // 2) - (window_height // 2)
-        parent.geometry(f'{window_width}x{window_height}+{x}+{y}')
-
-        self.configure(fg_color=parent.cget("fg_color"))
-        self.place(relx=0, rely=0, relwidth=1, relheight=1)
-        
-        # Configure grid
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-        
-        # Title
-        self.title_label = ctk.CTkLabel(
-            self, 
-            text="Fluidra Manufacturing Solution",
-            font=("Arial", 20, "bold")
-        )
-        self.title_label.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="nsew")
-        
-        # Status frame
-        self.status_frame = ctk.CTkFrame(self)
-        self.status_frame.grid(row=1, column=0, padx=20, pady=10, sticky="nsew")
-        self.status_frame.grid_columnconfigure(1, weight=1)
-        
-        # Status label
-        self.status_label = ctk.CTkLabel(
-            self.status_frame,
-            text="Starting up...",
-            font=("Arial", 14)
-        )
-        self.status_label.grid(row=0, column=0, padx=10, pady=10, sticky="w")
-        
-        # Progress bar
-        self.progress = ctk.CTkProgressBar(self.status_frame, mode='indeterminate')
-        self.progress.grid(row=1, column=0, padx=10, pady=10, sticky="ew", columnspan=2)
-        self.progress.start()
-        
-        # Version label
-        self.version_label = ctk.CTkLabel(
-            self,
-            text="FMS v7.10",
-            font=("Arial", 10, "italic"),
-            text_color="gray"
-        )
-        self.version_label.grid(row=2, column=0, pady=(0, 10))
-        
-        # Make sure the window stays on top
-        self.tkraise()
-        parent.lift()
-        parent.attributes('-topmost', True)
-        parent.after_idle(parent.attributes, '-topmost', False)
-    
-    def update_status(self, message):
-        self.status_label.configure(text=message)
-        self.tkraise()
-        self.update_idletasks()
-
 
 class BarcodeApp(ctk.CTk):
     # Software version
@@ -872,39 +812,15 @@ class BarcodeApp(ctk.CTk):
 
     @staticmethod
     def _format_window_geometry(width, height, x, y):
-        return f"{int(width)}x{int(height)}{int(x):+d}{int(y):+d}"
+        return format_window_geometry(width, height, x, y)
 
     @staticmethod
     def _tk_attribute_enabled(value):
-        return str(value).strip().lower() in {"1", "true", "yes"}
+        return tk_attribute_enabled(value)
 
     def _get_current_monitor_geometry(self):
         """Return the full monitor bounds for the screen containing this window."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class MONITORINFO(ctypes.Structure):
-                _fields_ = [
-                    ("cbSize", wintypes.DWORD),
-                    ("rcMonitor", wintypes.RECT),
-                    ("rcWork", wintypes.RECT),
-                    ("dwFlags", wintypes.DWORD),
-                ]
-
-            monitor = ctypes.windll.user32.MonitorFromWindow(self.winfo_id(), 2)
-            monitor_info = MONITORINFO()
-            monitor_info.cbSize = ctypes.sizeof(MONITORINFO)
-            if monitor and ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
-                rect = monitor_info.rcMonitor
-                width = rect.right - rect.left
-                height = rect.bottom - rect.top
-                if width > 0 and height > 0:
-                    return rect.left, rect.top, width, height
-        except Exception:
-            pass
-
-        return 0, 0, self.winfo_screenwidth(), self.winfo_screenheight()
+        return current_monitor_geometry(self)
 
     def _keep_main_window_front(self):
         if not getattr(self, "_main_topmost_enabled", True):
@@ -926,44 +842,7 @@ class BarcodeApp(ctk.CTk):
 
     def _present_app_dialog(self, dialog, focus_widget=None, modal=True):
         """Keep app dialogs above the kiosk dashboard and ready for input."""
-        def bring_forward():
-            try:
-                dialog.attributes("-topmost", True)
-            except Exception:
-                pass
-            try:
-                dialog.lift()
-                dialog.focus_force()
-            except Exception:
-                pass
-            if focus_widget is not None:
-                try:
-                    focus_widget.focus_force()
-                except Exception:
-                    try:
-                        focus_widget.focus_set()
-                    except Exception:
-                        pass
-
-        try:
-            dialog.transient(self)
-        except Exception:
-            pass
-        try:
-            dialog.attributes("-topmost", True)
-        except Exception:
-            pass
-        if modal:
-            try:
-                dialog.grab_set()
-            except Exception:
-                pass
-        bring_forward()
-        try:
-            dialog.after(50, bring_forward)
-            dialog.after(250, bring_forward)
-        except Exception:
-            pass
+        present_app_dialog(self, dialog, focus_widget, modal)
 
     def _set_windows_taskbar_visible(self, visible):
         """Show or hide the Windows taskbar for kiosk mode."""
@@ -1081,14 +960,11 @@ class BarcodeApp(ctk.CTk):
 
     def _main_font(self, size, weight=None):
         scale = float(getattr(self, "_main_ui_scale", 1.0) or 1.0)
-        if getattr(self, "_main_ui_compact", False):
-            scale = min(scale, 0.82)
-        font_size = max(8, int(size * scale))
-        return ("Arial", font_size, weight) if weight else ("Arial", font_size)
+        return scaled_font(size, scale, getattr(self, "_main_ui_compact", False), weight)
 
     def _main_dim(self, value, minimum=1):
         scale = float(getattr(self, "_main_ui_scale", 1.0) or 1.0)
-        return max(minimum, int(value * scale))
+        return scaled_dim(value, scale, minimum)
 
     def _cancel_scan_capture_callback(self):
         after_id = getattr(self, "_scan_capture_after_id", None)
@@ -2256,10 +2132,7 @@ class BarcodeApp(ctk.CTk):
             return ""
 
     def _show_text_in_box(self, textbox, value):
-        textbox.configure(state="normal")
-        textbox.delete("1.0", "end")
-        textbox.insert("1.0", value)
-        textbox.configure(state="disabled")
+        set_textbox_value(textbox, value)
 
     def _reprint_last_label(self):
         context = getattr(self, "last_label_context", None)
@@ -2280,57 +2153,22 @@ class BarcodeApp(ctk.CTk):
         )
 
     def show_status_logs_dialog(self):
-        dialog = ctk.CTkToplevel(self)
-        dialog.title("Status & Logs")
-        dialog.geometry("980x650")
-        dialog.minsize(850, 540)
-
-        action_bar = ctk.CTkFrame(dialog, fg_color="transparent")
-        action_bar.pack(fill="x", padx=12, pady=(12, 6))
-
-        tabview = ctk.CTkTabview(dialog)
-        tabview.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        status_tab = tabview.add("Live Status")
-        health_tab = tabview.add("Health")
-        print_tab = tabview.add("Print Audit")
-        error_tab = tabview.add("Errors")
-
-        status_text = ctk.CTkTextbox(status_tab, wrap="none")
-        status_text.pack(fill="both", expand=True, padx=8, pady=8)
-        health_text = ctk.CTkTextbox(health_tab, wrap="none")
-        health_text.pack(fill="both", expand=True, padx=8, pady=8)
-        print_text = ctk.CTkTextbox(print_tab, wrap="none")
-        print_text.pack(fill="both", expand=True, padx=8, pady=8)
-        error_text = ctk.CTkTextbox(error_tab, wrap="none")
-        error_text.pack(fill="both", expand=True, padx=8, pady=8)
-
-        def refresh():
-            self._show_text_in_box(status_text, self._format_live_status_details())
-            self._show_text_in_box(health_text, self._format_health_details())
-            self._show_text_in_box(print_text, self._format_print_audit_rows(self._read_recent_print_audit(limit=50)))
+        def errors_text():
             errors_path = os.path.join(BASE_PATH, "logs", "production_errors.log")
             errors = "".join(self._tail_text_file(errors_path, line_limit=120)).strip()
-            self._show_text_in_box(error_text, errors or "No recent error log entries.")
+            return errors or "No recent error log entries."
 
-        def sync_now():
-            try:
-                self.sync_all_to_google_sheets()
-            finally:
-                refresh()
-
-        ctk.CTkButton(action_bar, text="Refresh", width=120, command=refresh).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Sync Now", width=120, command=sync_now).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Reprint Last Label", width=160, command=lambda: (self._reprint_last_label(), refresh())).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Export Diagnostics", width=160, command=self.export_diagnostics_bundle).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(action_bar, text="Close", width=120, command=dialog.destroy).pack(side="right")
-
-        refresh()
-        try:
-            tabview.set("Live Status")
-        except Exception:
-            pass
-        self._present_app_dialog(dialog)
-        return dialog
+        return create_status_logs_dialog(
+            self,
+            live_status_text=self._format_live_status_details,
+            health_details_text=self._format_health_details,
+            print_audit_text=lambda: self._format_print_audit_rows(self._read_recent_print_audit(limit=50)),
+            errors_text=errors_text,
+            sync_now=self.sync_all_to_google_sheets,
+            reprint_last_label=self._reprint_last_label,
+            export_diagnostics_bundle=self.export_diagnostics_bundle,
+            present_dialog=self._present_app_dialog,
+        )
 
     def poll_teraoka_status(self):
         started_at = time.perf_counter()
@@ -6776,10 +6614,7 @@ class BarcodeApp(ctk.CTk):
 
 
     def _set_label_color(self, label, color):
-        try:
-            label.configure(text_color=color)
-        except Exception:
-            pass
+        set_label_color(label, color)
 
     def _apply_status_colors(self):
         try:
