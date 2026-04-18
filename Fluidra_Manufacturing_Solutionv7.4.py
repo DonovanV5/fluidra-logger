@@ -36,7 +36,6 @@ from fms_logging import (
     HEALTH_WARNING,
     configure_app_logger,
     elapsed_ms,
-    format_health_timestamp,
     get_log_context,
     health_state_color,
     log_event,
@@ -45,7 +44,6 @@ from fms_logging import (
     set_health_signal,
     set_log_context,
     structured_message,
-    worst_health_state,
 )
 from schema_contract import (
     DOWNTIME_HEADERS,
@@ -85,6 +83,36 @@ from persistence.server_csv_service import (
     server_product_csv_path,
     server_product_csv_paths,
     write_rows_to_csv_atomic,
+)
+from services.diagnostics_service import (
+    diagnostics_metadata as build_diagnostics_metadata,
+    format_health_details as build_health_details_text,
+    read_redacted_json_file,
+    redact_diagnostics_data,
+)
+from services.downtime_service import (
+    build_downtime_event_row,
+    coerce_auto_downtime_multiplier,
+    format_auto_downtime_multiplier,
+    resume_button_enabled,
+)
+from services.duplicate_service import duplicate_cache_lookup, should_refresh_barcode_cache
+from services.health_service import format_health_display_texts
+from services.production_service import (
+    build_production_event_row,
+    calculate_pcs_per_min,
+    calculate_production_duration,
+)
+from services.scan_service import calculate_scan_cycle_time, normalize_barcode
+from services.schedule_service import (
+    active_planned_break_window,
+    default_production_schedule,
+    get_production_schedule_mtime,
+    get_schedule_for_workcenter,
+    load_production_schedule_config,
+    normalize_production_schedule,
+    normalize_production_schedule_config,
+    normalize_workcenter_selection,
 )
 from utils.formatting_utils import parse_expected_cycle
 from utils.path_utils import get_base_path
@@ -182,75 +210,23 @@ PLANNED_BREAK_DEFINITIONS = (
 
 
 def _default_production_schedule():
-    return {
-        "shift_start": "07:30",
-        "shift_end": "15:30",
-        "tea1_start": "09:00",
-        "tea1_end": "09:15",
-        "lunch_start": "12:00",
-        "lunch_end": "12:30",
-        "tea2_start": "14:00",
-        "tea2_end": "14:15",
-    }
+    return default_production_schedule()
 
 
 def _normalize_production_schedule(data):
-    defaults = _default_production_schedule()
-    raw = data if isinstance(data, dict) else {}
-    normalized = {}
-    for key, default_value in defaults.items():
-        value = str(raw.get(key, default_value) or default_value).strip()
-        normalized[key] = value if len(value) == 5 and ":" in value else default_value
-    return normalized
+    return normalize_production_schedule(data)
 
 
 def _normalize_production_schedule_config(data):
-    defaults = _default_production_schedule()
-    normalized = {
-        "defaults": _default_production_schedule(),
-        "workcenters": {},
-    }
-    raw = data if isinstance(data, dict) else {}
-
-    if any(key in raw for key in defaults):
-        normalized["defaults"] = _normalize_production_schedule(raw)
-
-    defaults_raw = raw.get("defaults")
-    if isinstance(defaults_raw, dict):
-        normalized["defaults"] = _normalize_production_schedule(defaults_raw)
-
-    workcenters_raw = raw.get("workcenters")
-    if isinstance(workcenters_raw, dict):
-        for wc_key, schedule in workcenters_raw.items():
-            wc_id = str(wc_key or "").strip()
-            if not wc_id:
-                continue
-            normalized["workcenters"][wc_id] = _normalize_production_schedule(
-                schedule if isinstance(schedule, dict) else None
-            )
-
-    return normalized
+    return normalize_production_schedule_config(data)
 
 
 def _load_production_schedule_config():
-    try:
-        with open(PRODUCTION_SCHEDULE_FILE, "r", encoding="utf-8") as f:
-            return _normalize_production_schedule_config(json.load(f))
-    except Exception:
-        return {
-            "defaults": _default_production_schedule(),
-            "workcenters": {},
-        }
+    return load_production_schedule_config(PRODUCTION_SCHEDULE_FILE)
 
 
 def _get_schedule_for_workcenter(schedule_config, workcenter):
-    normalized_config = _normalize_production_schedule_config(schedule_config)
-    base_schedule = _normalize_production_schedule(normalized_config.get("defaults"))
-    wc_key = str(workcenter or "").strip()
-    wc_schedule = normalized_config.get("workcenters", {}).get(wc_key)
-    if isinstance(wc_schedule, dict):
-        return _normalize_production_schedule({**base_schedule, **wc_schedule})
-    return base_schedule
+    return get_schedule_for_workcenter(schedule_config, workcenter)
 
 
 def _load_user_prefs_file():
@@ -1545,9 +1521,7 @@ class BarcodeApp(ctk.CTk):
 
     def _normalize_barcode(self, b: str) -> str:
         """Normalize barcode for reliable duplicate detection (trim + uppercase)."""
-        if b is None:
-            return ""
-        return str(b).strip().upper()
+        return normalize_barcode(b)
 
     def _update_log_context(self):
         set_log_context(
@@ -1599,48 +1573,17 @@ class BarcodeApp(ctk.CTk):
         return signal
 
     def _refresh_health_display(self):
-        def _abbr(state):
-            mapping = {
-                HEALTH_OK: "OK",
-                HEALTH_WARNING: "WARN",
-                HEALTH_ERROR: "ERR",
-                HEALTH_UNKNOWN: "UNK",
-            }
-            return mapping.get(state, "UNK")
-
-        integrations = [
-            f"L:{_abbr(self.health_signals.get('local_store', {}).get('state', HEALTH_UNKNOWN))}",
-            f"S:{_abbr(self.health_signals.get('google_sheets', {}).get('state', HEALTH_UNKNOWN))}",
-            f"CSV:{_abbr(self.health_signals.get('server_csv', {}).get('state', HEALTH_UNKNOWN))}",
-            f"E:{_abbr(self.health_signals.get('excel', {}).get('state', HEALTH_UNKNOWN))}",
-            f"P:{_abbr(self.health_signals.get('printer', {}).get('state', HEALTH_UNKNOWN))}",
-            f"T:{_abbr(self.health_signals.get('teraoka', {}).get('state', HEALTH_UNKNOWN))}",
-        ]
-        integration_text = "Health " + " ".join(integrations)
+        integration_text, writes_text, integration_state, write_state = format_health_display_texts(
+            self.health_signals,
+            self.last_successful_scan_write_at,
+            self.last_successful_google_write_at,
+            self.last_successful_server_csv_write_at,
+            self.last_duplicate_check_failure_at,
+        )
         self.integration_health_var.set(integration_text)
 
-        scan_state = self.health_signals.get("scan_write", {}).get("state", HEALTH_UNKNOWN)
-        google_state = self.health_signals.get("google_write", {}).get("state", HEALTH_UNKNOWN)
-        dup_state = self.health_signals.get("duplicate_check", {}).get("state", HEALTH_UNKNOWN)
-        writes_text = (
-            "Writes "
-            f"Sc:{_abbr(scan_state)} {format_health_timestamp(self.last_successful_scan_write_at)} "
-            f"G:{_abbr(google_state)} {format_health_timestamp(self.last_successful_google_write_at)} "
-            f"CSV:{_abbr(self.health_signals.get('server_csv', {}).get('state', HEALTH_UNKNOWN))} "
-            f"{format_health_timestamp(self.last_successful_server_csv_write_at)} "
-            f"D:{_abbr(dup_state)} {format_health_timestamp(self.last_duplicate_check_failure_at)}"
-        )
         self.write_health_var.set(writes_text)
 
-        integration_state = worst_health_state(
-            self.health_signals.get("local_store", {}).get("state", HEALTH_UNKNOWN),
-            self.health_signals.get("google_sheets", {}).get("state", HEALTH_UNKNOWN),
-            self.health_signals.get("server_csv", {}).get("state", HEALTH_UNKNOWN),
-            self.health_signals.get("excel", {}).get("state", HEALTH_UNKNOWN),
-            self.health_signals.get("printer", {}).get("state", HEALTH_UNKNOWN),
-            self.health_signals.get("teraoka", {}).get("state", HEALTH_UNKNOWN),
-        )
-        write_state = worst_health_state(scan_state, google_state, self.health_signals.get("server_csv", {}).get("state", HEALTH_UNKNOWN), dup_state)
         if self.integration_health_label is not None:
             self.integration_health_label.configure(text_color=health_state_color(integration_state))
         if self.write_health_label is not None:
@@ -1876,10 +1819,7 @@ class BarcodeApp(ctk.CTk):
         self._set_barcode_entry_value("")
 
     def _calculate_scan_cycle_time(self, now):
-        previous_scan_time = self.last_scan_time if isinstance(self.last_scan_time, datetime) else None
-        if previous_scan_time is None:
-            return 0.0
-        return max(0.0, (now - previous_scan_time).total_seconds())
+        return calculate_scan_cycle_time(self.last_scan_time, now)
 
     def _build_sheet_row(self, data_map, headers):
         return build_sheet_row(data_map, headers)
@@ -2168,40 +2108,21 @@ class BarcodeApp(ctk.CTk):
         return "\n".join(lines)
 
     def _format_health_details(self):
-        lines = [f"Application: {self.VERSION}"]
         try:
-            lines.append(f"Workcenter: {self.current_workcenter}")
+            workcenter = self.current_workcenter
+            include_workcenter = True
         except Exception:
-            pass
-        lines.append("")
-        lines.append("Health")
-        for name in sorted(self.health_signals.keys()):
-            signal = self.health_signals.get(name, {})
-            state = signal.get("state", HEALTH_UNKNOWN)
-            detail = signal.get("detail", "")
-            updated = format_health_timestamp(signal.get("updated_at"))
-            lines.append(f"{name}: {state} | {updated} | {detail}")
-
-        lines.append("")
-        lines.append("Google Sync Backlog")
-        try:
-            summary = self.local_store.get_google_sync_summary() if self.local_store else {}
-        except Exception as e:
-            summary = {"error": str(e)}
-        if summary:
-            for key in sorted(summary.keys()):
-                lines.append(f"{key}: {summary.get(key)}")
-        else:
-            lines.append("No local sync summary available.")
-
-        lines.append("")
-        lines.append("Last Print")
-        if self.last_print_record:
-            for key in PRINT_AUDIT_HEADERS:
-                lines.append(f"{key}: {self.last_print_record.get(key, '')}")
-        else:
-            lines.append("No print attempted in this session.")
-        return "\n".join(lines)
+            workcenter = ""
+            include_workcenter = False
+        return build_health_details_text(
+            self.VERSION,
+            workcenter,
+            include_workcenter,
+            self.health_signals,
+            self.local_store,
+            self.last_print_record,
+            PRINT_AUDIT_HEADERS,
+        )
 
     def _format_live_status_details(self):
         def _read_var(text_var, default="-"):
@@ -2242,48 +2163,33 @@ class BarcodeApp(ctk.CTk):
         return "\n".join(lines)
 
     def _redact_diagnostics_data(self, value, key_name=""):
-        sensitive = re.search(r"(password|secret|token|private|credential|api[_-]?key)", str(key_name or ""), re.IGNORECASE)
-        if sensitive:
-            return "***REDACTED***"
-        if isinstance(value, dict):
-            return {key: self._redact_diagnostics_data(item, key) for key, item in value.items()}
-        if isinstance(value, list):
-            return [self._redact_diagnostics_data(item, key_name) for item in value]
-        return value
+        return redact_diagnostics_data(value, key_name)
 
     def _read_redacted_json_file(self, path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return self._redact_diagnostics_data(json.load(f))
-        except Exception as e:
-            return {"error": str(e), "path": path}
+        return read_redacted_json_file(path)
 
     def _diagnostics_metadata(self):
-        return {
-            "created_at": format_contract_timestamp(datetime.now()),
-            "app": self.VERSION,
-            "app_run_id": APP_RUN_ID,
-            "log_context": get_log_context(),
-            "host": APP_HOSTNAME,
-            "windows_user": os.environ.get("USERNAME") or os.environ.get("USER") or "",
-            "python_version": sys.version,
-            "platform": platform.platform(),
-            "base_path": BASE_PATH,
-            "workcenter": getattr(self, "current_workcenter", ""),
-            "logging_backend": getattr(self, "logging_backend", LOG_BACKEND_GOOGLE),
-            "server_csv_dir": getattr(self, "server_csv_dir", ""),
-            "server_csv_station_dir": self._server_csv_station_dir(),
-            "selected_zpl_preset": self._selected_zpl_preset_name(),
-            "label_width_mm": LABEL_WIDTH,
-            "label_height_mm": LABEL_HEIGHT,
-            "print_quantity": getattr(self, "print_quantity", ""),
-            "auto_downtime_multiplier": getattr(self, "auto_downtime_multiplier", ""),
-            "health_signals": self._redact_diagnostics_data(getattr(self, "health_signals", {})),
-            "google_credentials_present": os.path.exists(GOOGLE_CREDENTIALS_FILE),
-            "excel_file": getattr(self, "excel_file", ""),
-            "local_db_file": getattr(self, "local_db_file", ""),
-            "print_audit_file": getattr(self, "print_audit_file", ""),
-        }
+        return build_diagnostics_metadata(
+            app_version=self.VERSION,
+            app_run_id=APP_RUN_ID,
+            log_context=get_log_context(),
+            host=APP_HOSTNAME,
+            base_path=BASE_PATH,
+            workcenter=getattr(self, "current_workcenter", ""),
+            logging_backend=getattr(self, "logging_backend", LOG_BACKEND_GOOGLE),
+            server_csv_dir=getattr(self, "server_csv_dir", ""),
+            server_csv_station_dir=self._server_csv_station_dir(),
+            selected_zpl_preset=self._selected_zpl_preset_name(),
+            label_width_mm=LABEL_WIDTH,
+            label_height_mm=LABEL_HEIGHT,
+            print_quantity=getattr(self, "print_quantity", ""),
+            auto_downtime_multiplier=getattr(self, "auto_downtime_multiplier", ""),
+            health_signals=getattr(self, "health_signals", {}),
+            google_credentials_file=GOOGLE_CREDENTIALS_FILE,
+            excel_file=getattr(self, "excel_file", ""),
+            local_db_file=getattr(self, "local_db_file", ""),
+            print_audit_file=getattr(self, "print_audit_file", ""),
+        )
 
     def export_diagnostics_bundle(self):
         started_at = time.perf_counter()
@@ -2580,10 +2486,7 @@ class BarcodeApp(ctk.CTk):
             self._set_health_signal("teraoka", HEALTH_WARNING, "Config load failed")
 
     def _get_production_schedule_mtime(self):
-        try:
-            return os.path.getmtime(PRODUCTION_SCHEDULE_FILE)
-        except OSError:
-            return None
+        return get_production_schedule_mtime(PRODUCTION_SCHEDULE_FILE)
 
     def _refresh_production_schedule_config_if_needed(self):
         current_mtime = self._get_production_schedule_mtime()
@@ -2595,46 +2498,13 @@ class BarcodeApp(ctk.CTk):
             self._production_schedule_mtime = current_mtime
 
     def _get_active_planned_break_window(self, now=None):
-        now = now if isinstance(now, datetime) else datetime.now()
         self._refresh_production_schedule_config_if_needed()
-        schedule = _get_schedule_for_workcenter(self._production_schedule_config, self.current_workcenter)
-
-        for day_offset in (-1, 0):
-            base_day = now.date() + timedelta(days=day_offset)
-            shift_start = datetime.combine(base_day, datetime.min.time()).replace(
-                hour=int(str(schedule.get("shift_start", "07:30")).split(":")[0]),
-                minute=int(str(schedule.get("shift_start", "07:30")).split(":")[1]),
-            )
-            shift_end = datetime.combine(base_day, datetime.min.time()).replace(
-                hour=int(str(schedule.get("shift_end", "15:30")).split(":")[0]),
-                minute=int(str(schedule.get("shift_end", "15:30")).split(":")[1]),
-            )
-            if shift_end <= shift_start:
-                shift_end += timedelta(days=1)
-
-            for label, break_start_key, break_end_key in PLANNED_BREAK_DEFINITIONS:
-                break_start = datetime.combine(base_day, datetime.min.time()).replace(
-                    hour=int(str(schedule.get(break_start_key, "00:00")).split(":")[0]),
-                    minute=int(str(schedule.get(break_start_key, "00:00")).split(":")[1]),
-                )
-                break_end = datetime.combine(base_day, datetime.min.time()).replace(
-                    hour=int(str(schedule.get(break_end_key, "00:00")).split(":")[0]),
-                    minute=int(str(schedule.get(break_end_key, "00:00")).split(":")[1]),
-                )
-                if shift_end.date() > shift_start.date() and break_start < shift_start:
-                    break_start += timedelta(days=1)
-                    break_end += timedelta(days=1)
-                if break_end <= break_start:
-                    break_end += timedelta(days=1)
-                if break_start <= now < break_end:
-                    return {
-                        "key": f"{self.current_workcenter}|{format_contract_timestamp(break_start)}|{label}",
-                        "label": label,
-                        "start": break_start,
-                        "end": break_end,
-                        "workcenter": self.current_workcenter,
-                    }
-        return None
+        return active_planned_break_window(
+            self._production_schedule_config,
+            self.current_workcenter,
+            PLANNED_BREAK_DEFINITIONS,
+            now,
+        )
 
     def _start_downtime_sync_worker(self, event_id, context_label):
         try:
@@ -2656,7 +2526,7 @@ class BarcodeApp(ctk.CTk):
             self._set_health_signal("google_write", HEALTH_WARNING, f"{context_label} stored locally; sync worker failed")
 
     def _ensure_planned_break_event_logged(self, break_window):
-        downtime_row = build_downtime_row(
+        downtime_row = build_downtime_event_row(
             timestamp=break_window["start"],
             duration_seconds=(break_window["end"] - break_window["start"]).total_seconds(),
             reason=break_window["label"],
@@ -2734,21 +2604,21 @@ class BarcodeApp(ctk.CTk):
         self._active_planned_break_context = None
 
     def _normalize_current_workcenter(self):
-        valid_workcenters = [str(wc.get("id", "")).strip() for wc in self.workcenters if str(wc.get("id", "")).strip()]
-        if not valid_workcenters:
-            self.workcenters = [{"id": TERAOKA_WORKCENTER, "name": TERAOKA_WORKCENTER}]
-            valid_workcenters = [TERAOKA_WORKCENTER]
-
-        current_value = str(getattr(self, "current_workcenter", "") or "").strip()
-        if current_value not in valid_workcenters:
-            self.current_workcenter = valid_workcenters[0]
+        workcenters, selected_workcenter, previous_workcenter, changed, available_count = normalize_workcenter_selection(
+            self.workcenters,
+            getattr(self, "current_workcenter", ""),
+            TERAOKA_WORKCENTER,
+        )
+        self.workcenters = workcenters
+        if changed:
+            self.current_workcenter = selected_workcenter
             log_event(
                 LOGGER,
                 logging.INFO,
                 "workcenter_selection_normalized",
-                previous=current_value,
+                previous=previous_workcenter,
                 selected=self.current_workcenter,
-                available=len(valid_workcenters),
+                available=available_count,
             )
 
     def _on_workcenter_selected(self, new_wc_id: str):
@@ -4371,29 +4241,27 @@ class BarcodeApp(ctk.CTk):
         b = self._normalize_barcode(barcode)
 
         with self._barcode_cache_lock:
-            in_scanned_barcodes = b in self.scanned_barcodes
-            in_barcode_cache = b in self._barcode_cache
-            last_barcode_check = self._last_barcode_check
+            cached_duplicate, duplicate_source, temporal_cache_hit = duplicate_cache_lookup(
+                b,
+                self.scanned_barcodes,
+                self._barcode_cache,
+                self._last_barcode_check,
+                self._last_barcode_result,
+            )
             last_barcode_result = self._last_barcode_result
             barcode_cache_last_update = self._barcode_cache_last_update
 
-        # 1. Check in-memory scanned_barcodes set (fastest)
-        if in_scanned_barcodes:
-            log_event(LOGGER, logging.INFO, "duplicate_barcode_detected", barcode=b, source="memory")
+        # 1-3. Check in-memory, sheet cache, and temporal cache before slower fallbacks.
+        if cached_duplicate is True:
+            if duplicate_source:
+                log_event(LOGGER, logging.INFO, "duplicate_barcode_detected", barcode=b, source=duplicate_source)
             return True
-            
-        # 2. Check memory cache (from Google Sheets)
-        if in_barcode_cache:
-            log_event(LOGGER, logging.INFO, "duplicate_barcode_detected", barcode=b, source="cache")
-            return True
-            
-        # 3. Check if we just looked this up (temporal cache)
-        if b == last_barcode_check:
+        if temporal_cache_hit:
             return last_barcode_result
             
         # 4. If cache is empty or stale, trigger an update in the background
         current_time = time.time()
-        if current_time - barcode_cache_last_update > self._barcode_cache_ttl:
+        if should_refresh_barcode_cache(barcode_cache_last_update, self._barcode_cache_ttl, current_time):
             threading.Thread(target=self._update_barcode_cache, daemon=True).start()
 
         # 5. Check the durable local store before any remote lookup.
@@ -5422,7 +5290,7 @@ class BarcodeApp(ctk.CTk):
                 self.barcode_label_var.set(product_info.get("Barc", "") or "N/A")
 
             proposed_start_time = datetime.now()
-            start_row = build_production_row(
+            start_row = build_production_event_row(
                 timestamp=proposed_start_time,
                 event_type=PRODUCTION_EVENT_START,
                 product_code=self.product_var.get() or 'N/A',
@@ -5532,10 +5400,10 @@ class BarcodeApp(ctk.CTk):
                 
             print(f"[DEBUG] Stopping production...")
             end_time = datetime.now()
-            duration = (end_time - self.start_time).total_seconds()
+            duration = calculate_production_duration(self.start_time, end_time)
             print(f"[DEBUG] Production duration: {duration:.2f} seconds")
 
-            stop_row = build_production_row(
+            stop_row = build_production_event_row(
                 timestamp=end_time,
                 event_type=PRODUCTION_EVENT_END,
                 product_code=self.product_var.get() or 'N/A',
@@ -6530,7 +6398,7 @@ class BarcodeApp(ctk.CTk):
             if self.start_time:
                 self.total_runtime_seconds = (now - self.start_time).total_seconds()
                 if self.total_runtime_seconds > 0:
-                    pcs_per_min = (self.production_count / self.total_runtime_seconds) * 60
+                    pcs_per_min = calculate_pcs_per_min(self.production_count, self.total_runtime_seconds)
                     self.pcs_min_var.set(f"{pcs_per_min:.2f}")
 
             # Enqueue job receipt to Teraoka (non-blocking) only if enabled
@@ -6700,11 +6568,13 @@ class BarcodeApp(ctk.CTk):
     def check_resume_button_state(self, *args):
         """Enable Resume button only when reason selected, operator name and description are provided."""
         try:
-            name_ok = bool(self.operator_name_var.get().strip())
-            reason_ok = bool(self.downtime_reason and str(self.downtime_reason).strip() and self.downtime_reason != "Select Reason")
-            desc_ok = bool(self.operator_reason_var.get().strip())
+            enabled = resume_button_enabled(
+                self.operator_name_var.get(),
+                self.downtime_reason,
+                self.operator_reason_var.get(),
+            )
             if hasattr(self, 'resume_button'):
-                self.resume_button.configure(state="normal" if (name_ok and reason_ok and desc_ok) else "disabled")
+                self.resume_button.configure(state="normal" if enabled else "disabled")
         except Exception:
             pass
 
@@ -6717,7 +6587,7 @@ class BarcodeApp(ctk.CTk):
         end_time = datetime.now()
         duration = (end_time - self.downtime_start).total_seconds()
 
-        downtime_row = build_downtime_row(
+        downtime_row = build_downtime_event_row(
             timestamp=self.downtime_start,
             duration_seconds=duration,
             reason=reason2 or 'Unknown',
@@ -6771,7 +6641,7 @@ class BarcodeApp(ctk.CTk):
     def end_downtime(self):
         end = datetime.now()
         duration = (end - self.downtime_start).total_seconds()
-        downtime_row = build_downtime_row(
+        downtime_row = build_downtime_event_row(
             timestamp=self.downtime_start,
             duration_seconds=duration,
             reason=self.downtime_reason or 'Unknown',
@@ -7209,18 +7079,10 @@ class BarcodeApp(ctk.CTk):
         return quantity
 
     def _format_auto_downtime_multiplier(self, value):
-        numeric = float(value)
-        if numeric.is_integer():
-            return str(int(numeric))
-        return f"{numeric:.2f}".rstrip("0").rstrip(".")
+        return format_auto_downtime_multiplier(value)
 
     def _set_auto_downtime_multiplier(self, value):
-        try:
-            multiplier = float(str(value).strip())
-        except (TypeError, ValueError):
-            multiplier = 2.5
-        if not 1.0 <= multiplier <= 20.0:
-            raise ValueError("Auto downtime multiplier must be between 1 and 20.")
+        multiplier = coerce_auto_downtime_multiplier(value)
         self.auto_downtime_multiplier = multiplier
         try:
             if hasattr(self, "auto_downtime_multiplier_var") and self.auto_downtime_multiplier_var is not None:
