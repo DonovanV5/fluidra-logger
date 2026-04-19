@@ -148,19 +148,6 @@ from services.teraoka_service import (
     shutdown_teraoka_client,
     start_teraoka_client,
 )
-from ui.job_acceptance_dialog import show_job_acceptance_dialog
-from ui.startup_screen import StartupScreen
-from ui.status_dialog import create_status_logs_dialog
-from ui.window_utils import (
-    current_monitor_geometry,
-    format_window_geometry,
-    present_app_dialog,
-    scaled_dim,
-    scaled_font,
-    set_label_color,
-    set_textbox_value,
-    tk_attribute_enabled,
-)
 from utils.formatting_utils import parse_expected_cycle
 from utils.path_utils import get_base_path
 
@@ -2161,199 +2148,57 @@ class BarcodeApp(ctk.CTk):
         )
 
     def show_status_logs_dialog(self):
-        def errors_text():
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("Status & Logs")
+        dialog.geometry("980x650")
+        dialog.minsize(850, 540)
+
+        action_bar = ctk.CTkFrame(dialog, fg_color="transparent")
+        action_bar.pack(fill="x", padx=12, pady=(12, 6))
+
+        tabview = ctk.CTkTabview(dialog)
+        tabview.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        status_tab = tabview.add("Live Status")
+        health_tab = tabview.add("Health")
+        print_tab = tabview.add("Print Audit")
+        error_tab = tabview.add("Errors")
+
+        status_text = ctk.CTkTextbox(status_tab, wrap="none")
+        status_text.pack(fill="both", expand=True, padx=8, pady=8)
+        health_text = ctk.CTkTextbox(health_tab, wrap="none")
+        health_text.pack(fill="both", expand=True, padx=8, pady=8)
+        print_text = ctk.CTkTextbox(print_tab, wrap="none")
+        print_text.pack(fill="both", expand=True, padx=8, pady=8)
+        error_text = ctk.CTkTextbox(error_tab, wrap="none")
+        error_text.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def refresh():
+            self._show_text_in_box(status_text, self._format_live_status_details())
+            self._show_text_in_box(health_text, self._format_health_details())
+            self._show_text_in_box(print_text, self._format_print_audit_rows(self._read_recent_print_audit(limit=50)))
             errors_path = os.path.join(BASE_PATH, "logs", "production_errors.log")
             errors = "".join(self._tail_text_file(errors_path, line_limit=120)).strip()
-            return errors or "No recent error log entries."
+            self._show_text_in_box(error_text, errors or "No recent error log entries.")
 
-        return create_status_logs_dialog(
-            self,
-            live_status_text=self._format_live_status_details,
-            health_details_text=self._format_health_details,
-            print_audit_text=lambda: self._format_print_audit_rows(self._read_recent_print_audit(limit=50)),
-            errors_text=errors_text,
-            sync_now=self.sync_all_to_google_sheets,
-            reprint_last_label=self._reprint_last_label,
-            export_diagnostics_bundle=self.export_diagnostics_bundle,
-            present_dialog=self._present_app_dialog,
-        )
-
-    def _ensure_job_context(self):
-        if not hasattr(self, "job_context") or self.job_context is None:
-            self.job_context = JobContextManager()
-        return self.job_context
-
-    def _active_job_context(self):
-        return self._ensure_job_context().active_job
-
-    def _proposed_job_context(self):
-        return self._ensure_job_context().proposed_job
-
-    def _format_job_context_details(self):
-        manager = self._ensure_job_context()
-        active = manager.active_job
-        proposed = manager.proposed_job
-
-        def _line(prefix, job):
-            if not job:
-                return [f"{prefix}: -"]
-            percent = f"{job.percent_complete:.1f}%" if job.percent_complete is not None else "-"
-            return [
-                f"{prefix}: {job.job_id or '-'}",
-                f"{prefix} Product: {job.product_code or '-'}",
-                f"{prefix} Target: {job.target_quantity if job.target_quantity is not None else '-'}",
-                f"{prefix} Actual: {job.actual_quantity if job.actual_quantity is not None else '-'}",
-                f"{prefix} Remaining: {job.remaining_quantity if job.remaining_quantity is not None else '-'}",
-                f"{prefix} Complete: {percent}",
-                f"{prefix} Timing: {job.behind_ahead_status or 'Unknown'}",
-            ]
-
-        lines = ["Job Execution"]
-        lines.extend(_line("Active Job", active))
-        lines.extend(_line("Proposed Job", proposed))
-        return "\n".join(lines)
-
-    def _sync_teraoka_proposed_job(self, status, prompt=True):
-        manager = self._ensure_job_context()
-        proposed_job = job_from_teraoka_status(status, self.current_workcenter)
-        if proposed_job is None:
-            manager.clear_proposed_job()
-            return None
-
-        previous_key = manager.proposed_job.key if manager.proposed_job else ""
-        manager.propose_job(proposed_job)
-        if previous_key != proposed_job.key:
-            log_event(
-                LOGGER,
-                logging.INFO,
-                "job_context_proposed",
-                source=proposed_job.source,
-                job_id=proposed_job.job_id,
-                sequence=proposed_job.sequence,
-                product_code=proposed_job.product_code,
-                target_quantity=proposed_job.target_quantity,
-                workcenter=proposed_job.workcenter,
-            )
-
-        if prompt and manager.requires_acceptance(proposed_job):
-            self._prompt_for_job_acceptance(proposed_job)
-        return proposed_job
-
-    def _prompt_for_job_acceptance(self, job: JobContext):
-        if not self.teraoka_enabled.get():
-            return None
-        try:
-            existing_dialog = getattr(self, "_job_acceptance_dialog", None)
-            if existing_dialog is not None and existing_dialog.winfo_exists():
-                return existing_dialog
-        except Exception:
-            pass
-
-        def on_cancel(_job):
-            log_event(
-                LOGGER,
-                logging.INFO,
-                "job_acceptance_deferred",
-                source=_job.source,
-                job_id=_job.job_id,
-                product_code=_job.product_code,
-                workcenter=_job.workcenter,
-            )
-            self._job_acceptance_dialog = None
-            self._schedule_scan_focus()
-
-        self._job_acceptance_dialog = show_job_acceptance_dialog(
-            self,
-            job,
-            accept_callback=self._accept_proposed_job,
-            cancel_callback=on_cancel,
-            present_dialog=self._present_app_dialog,
-        )
-        log_event(
-            LOGGER,
-            logging.INFO,
-            "job_acceptance_prompt_shown",
-            source=job.source,
-            job_id=job.job_id,
-            product_code=job.product_code,
-            workcenter=job.workcenter,
-        )
-        return self._job_acceptance_dialog
-
-    def _apply_accepted_job_product(self, job: JobContext):
-        product_code = str(job.product_code or "").strip()
-        if not product_code:
-            return False
-        try:
-            self._select_product(product_code)
-        except Exception:
-            LOGGER.exception(
-                structured_message(
-                    "job_acceptance_product_select_failed",
-                    job_id=job.job_id,
-                    product_code=product_code,
-                    workcenter=job.workcenter,
-                )
-            )
-            self.product_var.set(product_code)
+        def sync_now():
             try:
-                self.update_description_on_select(product_code)
-            except Exception:
-                LOGGER.exception(
-                    structured_message(
-                        "job_acceptance_product_details_update_failed",
-                        job_id=job.job_id,
-                        product_code=product_code,
-                    )
-                )
-        return True
+                self.sync_all_to_google_sheets()
+            finally:
+                refresh()
 
-    def _accept_proposed_job(self, job: JobContext | None = None):
-        manager = self._ensure_job_context()
-        if job is not None and (manager.proposed_job is None or manager.proposed_job.key != job.key):
-            manager.propose_job(job)
-        accepted_job = manager.accept_proposed_job()
-        if accepted_job is None:
-            return False
+        ctk.CTkButton(action_bar, text="Refresh", width=120, command=refresh).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_bar, text="Sync Now", width=120, command=sync_now).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_bar, text="Reprint Last Label", width=160, command=lambda: (self._reprint_last_label(), refresh())).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_bar, text="Export Diagnostics", width=160, command=self.export_diagnostics_bundle).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(action_bar, text="Close", width=120, command=dialog.destroy).pack(side="right")
 
-        self._apply_accepted_job_product(accepted_job)
-        self._set_health_signal("teraoka", HEALTH_OK, f"Job accepted: {accepted_job.job_id}")
-        log_event(
-            LOGGER,
-            logging.INFO,
-            "job_context_accepted",
-            source=accepted_job.source,
-            job_id=accepted_job.job_id,
-            sequence=accepted_job.sequence,
-            product_code=accepted_job.product_code,
-            target_quantity=accepted_job.target_quantity,
-            actual_quantity=accepted_job.actual_quantity,
-            remaining_quantity=accepted_job.remaining_quantity,
-            workcenter=accepted_job.workcenter,
-        )
-        self._job_acceptance_dialog = None
+        refresh()
         try:
-            self._update_scan_entry_state()
+            tabview.set("Live Status")
         except Exception:
             pass
-        self._schedule_scan_focus(force=True, attempts=3)
-        return True
-
-    def _teraoka_job_ready_for_scan(self, prompt=True):
-        if not self.teraoka_enabled.get():
-            return True, "Teraoka disabled"
-        try:
-            status = read_teraoka_status(getattr(self, 'teraoka', None))
-        except Exception:
-            LOGGER.exception(structured_message("teraoka_status_read_failed_for_scan", workcenter=self.current_workcenter))
-            return False, "Scanning is enabled only when Teraoka is connected and a job is received."
-
-        proposed_job = self._sync_teraoka_proposed_job(status, prompt=prompt)
-        if proposed_job is None:
-            return False, "Scanning is enabled only when Teraoka is connected and a job is received."
-        if not self._ensure_job_context().is_active_for(proposed_job):
-            return False, "Please accept the proposed Teraoka job before scanning."
-        return True, "Teraoka job accepted"
+        self._present_app_dialog(dialog)
+        return dialog
 
     def poll_teraoka_status(self):
         started_at = time.perf_counter()
